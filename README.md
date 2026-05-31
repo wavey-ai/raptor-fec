@@ -19,6 +19,21 @@ The UDP wire format matches the implementation that previously lived in `web-ser
 
 All integer fields in the 12-byte header are little-endian.
 
+## Interop Testing
+
+The `raptor-udp-fec` crate has ignored integration tests that verify raw
+RaptorQ packet compatibility against the independent C implementation
+[`nanorq`](https://github.com/sleepybishop/nanorq). The tests compile a small
+C helper at runtime, then verify both directions:
+
+- Rust `raptorq` symbols decode successfully with `nanorq`.
+- `nanorq` symbols decode successfully with Rust `raptorq`.
+
+```sh
+git clone --recurse-submodules https://github.com/sleepybishop/nanorq /tmp/nanorq
+NANORQ_DIR=/tmp/nanorq cargo test -p raptor-udp-fec --test nanorq_interop -- --ignored
+```
+
 ## Publishing
 
 After GitHub authentication is available:

@@ -1,0 +1,16 @@
+[package]
+name = "raptor-udp-fec"
+version = "0.1.0"
+edition.workspace = true
+description = "RaptorQ FEC framing for low-latency UDP and datagram transports."
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[features]
+default = ["udp"]
+udp = ["dep:tokio"]
+
+[dependencies]
+raptorq.workspace = true
+tokio = { workspace = true, optional = true, features = ["net"] }

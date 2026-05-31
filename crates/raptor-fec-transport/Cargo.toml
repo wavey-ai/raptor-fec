@@ -1,0 +1,13 @@
+[package]
+name = "raptor-fec-transport"
+version = "0.1.0"
+edition.workspace = true
+description = "FEC wrappers for WebTransport datagrams and WebRTC data channels."
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+raptor-udp-fec = { workspace = true, default-features = false }

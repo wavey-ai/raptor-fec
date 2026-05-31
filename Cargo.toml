@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/raptor-udp-fec",
+    "crates/raptor-fec-transport",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/wavey-ai/raptor-fec"
+homepage = "https://github.com/wavey-ai/raptor-fec"
+authors = ["Wavey AI"]
+
+[workspace.dependencies]
+async-trait = "0.1.88"
+bytes = "1.5"
+raptor-udp-fec = { path = "crates/raptor-udp-fec", version = "0.1.0", default-features = false }
+raptorq = "2"
+tokio = { version = "1.45", default-features = false }

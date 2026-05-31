@@ -488,7 +488,7 @@ fn scratch_dir(name: &str) -> PathBuf {
         .expect("system clock before unix epoch")
         .as_nanos();
     let dir = env::temp_dir().join(format!(
-        "raptor-udp-fec-nanorq-{name}-{}-{nanos}",
+        "raptorq-datagram-fec-nanorq-{name}-{}-{nanos}",
         std::process::id()
     ));
     fs::create_dir_all(&dir).expect("create scratch dir");

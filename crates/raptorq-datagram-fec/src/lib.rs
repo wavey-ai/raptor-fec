@@ -1,4 +1,4 @@
-//! RaptorQ forward-error-correction framing for UDP-sized datagrams.
+//! RaptorQ forward-error-correction framing for low-latency datagrams.
 //!
 //! The crate keeps the wire protocol intentionally small: every datagram starts
 //! with a 12-byte little-endian header followed by a serialized RaptorQ
@@ -29,13 +29,13 @@ pub const COMPLETED_WINDOW: u32 = 64;
 
 /// Encoder configuration for one protected application block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UdpFecConfig {
+pub struct DatagramFecConfig {
     pub source_symbols: u16,
     pub repair_symbols: u32,
     pub symbol_size: u16,
 }
 
-impl Default for UdpFecConfig {
+impl Default for DatagramFecConfig {
     fn default() -> Self {
         Self {
             source_symbols: DEFAULT_SOURCE_SYMBOLS,
@@ -45,7 +45,7 @@ impl Default for UdpFecConfig {
     }
 }
 
-impl UdpFecConfig {
+impl DatagramFecConfig {
     pub fn max_payload_len(self) -> usize {
         usize::from(self.source_symbols.max(1)) * usize::from(self.symbol_size.max(1))
     }
@@ -57,17 +57,17 @@ impl UdpFecConfig {
 
 /// The 12-byte prefix carried by every encoded datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UdpFecHeader {
+pub struct DatagramFecHeader {
     pub block_id: u32,
     pub transfer_length: u32,
     pub source_symbols: u16,
     pub symbol_size: u16,
 }
 
-impl UdpFecHeader {
-    pub fn encode(&self, bytes: &mut [u8]) -> Result<(), UdpFecError> {
+impl DatagramFecHeader {
+    pub fn encode(&self, bytes: &mut [u8]) -> Result<(), DatagramFecError> {
         if bytes.len() < HEADER_LEN {
-            return Err(UdpFecError::HeaderTooShort {
+            return Err(DatagramFecError::HeaderTooShort {
                 actual: bytes.len(),
             });
         }
@@ -79,9 +79,9 @@ impl UdpFecHeader {
         Ok(())
     }
 
-    pub fn decode(bytes: &[u8]) -> Result<Self, UdpFecError> {
+    pub fn decode(bytes: &[u8]) -> Result<Self, DatagramFecError> {
         if bytes.len() < HEADER_LEN {
-            return Err(UdpFecError::HeaderTooShort {
+            return Err(DatagramFecError::HeaderTooShort {
                 actual: bytes.len(),
             });
         }
@@ -92,10 +92,10 @@ impl UdpFecHeader {
             u16::from_le_bytes(bytes[10..12].try_into().expect("header length checked"));
 
         if source_symbols == 0 {
-            return Err(UdpFecError::InvalidSourceSymbols(source_symbols));
+            return Err(DatagramFecError::InvalidSourceSymbols(source_symbols));
         }
         if symbol_size == 0 {
-            return Err(UdpFecError::InvalidSymbolSize(symbol_size));
+            return Err(DatagramFecError::InvalidSymbolSize(symbol_size));
         }
 
         Ok(Self {
@@ -118,7 +118,7 @@ impl UdpFecHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UdpFecError {
+pub enum DatagramFecError {
     HeaderTooShort { actual: usize },
     PacketTooShort { actual: usize },
     InvalidSourceSymbols(u16),
@@ -127,64 +127,67 @@ pub enum UdpFecError {
     PayloadTooLargeForBlock { actual: usize, max: usize },
 }
 
-impl fmt::Display for UdpFecError {
+impl fmt::Display for DatagramFecError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HeaderTooShort { actual } => {
                 write!(
                     formatter,
-                    "UDP-FEC header too short: expected {HEADER_LEN}, got {actual}"
+                    "datagram FEC header too short: expected {HEADER_LEN}, got {actual}"
                 )
             }
             Self::PacketTooShort { actual } => {
                 write!(
                     formatter,
-                    "UDP-FEC packet too short: expected at least {}, got {actual}",
+                    "datagram FEC packet too short: expected at least {}, got {actual}",
                     HEADER_LEN + ENCODING_PACKET_HEADER_LEN
                 )
             }
             Self::InvalidSourceSymbols(value) => {
-                write!(formatter, "invalid UDP-FEC source symbol count: {value}")
+                write!(
+                    formatter,
+                    "invalid datagram FEC source symbol count: {value}"
+                )
             }
             Self::InvalidSymbolSize(value) => {
-                write!(formatter, "invalid UDP-FEC symbol size: {value}")
+                write!(formatter, "invalid datagram FEC symbol size: {value}")
             }
             Self::PayloadTooLong { actual } => {
                 write!(
                     formatter,
-                    "UDP-FEC payload too long for u32 header: {actual}"
+                    "datagram FEC payload too long for u32 header: {actual}"
                 )
             }
             Self::PayloadTooLargeForBlock { actual, max } => {
                 write!(
                     formatter,
-                    "UDP-FEC block payload too large: got {actual} bytes, max is {max}"
+                    "datagram FEC block payload too large: got {actual} bytes, max is {max}"
                 )
             }
         }
     }
 }
 
-impl std::error::Error for UdpFecError {}
+impl std::error::Error for DatagramFecError {}
 
 /// Stateful RaptorQ encoder that assigns monotonically increasing block ids.
 #[derive(Debug, Clone)]
-pub struct UdpFecEncoder {
+pub struct DatagramFecEncoder {
     block_id: u32,
-    config: UdpFecConfig,
+    config: DatagramFecConfig,
 }
 
-impl Default for UdpFecEncoder {
+impl Default for DatagramFecEncoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl UdpFecEncoder {
+impl DatagramFecEncoder {
     pub fn new() -> Self {
         Self {
             block_id: 0,
-            config: UdpFecConfig::default(),
+            config: DatagramFecConfig::default(),
         }
     }
 
@@ -219,7 +222,7 @@ impl UdpFecEncoder {
         self.block_id
     }
 
-    pub fn config(&self) -> UdpFecConfig {
+    pub fn config(&self) -> DatagramFecConfig {
         self.config
     }
 
@@ -236,14 +239,14 @@ impl UdpFecEncoder {
     }
 
     /// Encode exactly one configured FEC block.
-    pub fn encode_block(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, UdpFecError> {
+    pub fn encode_block(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DatagramFecError> {
         if data.len() > u32::MAX as usize {
-            return Err(UdpFecError::PayloadTooLong { actual: data.len() });
+            return Err(DatagramFecError::PayloadTooLong { actual: data.len() });
         }
 
         let max = self.config.max_payload_len();
         if data.len() > max {
-            return Err(UdpFecError::PayloadTooLargeForBlock {
+            return Err(DatagramFecError::PayloadTooLargeForBlock {
                 actual: data.len(),
                 max,
             });
@@ -253,9 +256,9 @@ impl UdpFecEncoder {
     }
 
     /// Split `data` into configured block-sized chunks and encode all chunks.
-    pub fn encode_payload(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, UdpFecError> {
+    pub fn encode_payload(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DatagramFecError> {
         if data.len() > u32::MAX as usize {
-            return Err(UdpFecError::PayloadTooLong { actual: data.len() });
+            return Err(DatagramFecError::PayloadTooLong { actual: data.len() });
         }
 
         let mut datagrams = Vec::new();
@@ -271,11 +274,11 @@ impl UdpFecEncoder {
         Ok(datagrams)
     }
 
-    fn encode_one_block(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, UdpFecError> {
+    fn encode_one_block(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DatagramFecError> {
         let encoder = Encoder::with_defaults(data, self.config.symbol_size);
         let raptor_config = encoder.get_config();
         let packets = encoder.get_encoded_packets(self.config.repair_symbols);
-        let header = UdpFecHeader {
+        let header = DatagramFecHeader {
             block_id: self.block_id,
             transfer_length: data.len() as u32,
             source_symbols: source_symbol_count(data.len(), raptor_config.symbol_size()),
@@ -304,24 +307,24 @@ struct BlockState {
 
 /// Stateful decoder for one ordered datagram flow.
 #[derive(Debug, Default)]
-pub struct UdpFecDecoder {
+pub struct DatagramFecDecoder {
     blocks: HashMap<u32, BlockState>,
     completed: HashSet<u32>,
 }
 
-impl UdpFecDecoder {
+impl DatagramFecDecoder {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn push_datagram(&mut self, datagram: &[u8]) -> Result<Option<Vec<u8>>, UdpFecError> {
+    pub fn push_datagram(&mut self, datagram: &[u8]) -> Result<Option<Vec<u8>>, DatagramFecError> {
         if datagram.len() < HEADER_LEN + ENCODING_PACKET_HEADER_LEN {
-            return Err(UdpFecError::PacketTooShort {
+            return Err(DatagramFecError::PacketTooShort {
                 actual: datagram.len(),
             });
         }
 
-        let header = UdpFecHeader::decode(datagram)?;
+        let header = DatagramFecHeader::decode(datagram)?;
         if self.completed.contains(&header.block_id) {
             return Ok(None);
         }
@@ -358,7 +361,7 @@ impl UdpFecDecoder {
 pub struct UdpFecSender {
     socket: UdpSocket,
     target: SocketAddr,
-    encoder: UdpFecEncoder,
+    encoder: DatagramFecEncoder,
 }
 
 #[cfg(feature = "udp")]
@@ -377,7 +380,7 @@ impl UdpFecSender {
         Ok(Self {
             socket,
             target,
-            encoder: UdpFecEncoder::new(),
+            encoder: DatagramFecEncoder::new(),
         })
     }
 
@@ -404,11 +407,11 @@ impl UdpFecSender {
         self.target
     }
 
-    pub fn encoder(&self) -> &UdpFecEncoder {
+    pub fn encoder(&self) -> &DatagramFecEncoder {
         &self.encoder
     }
 
-    pub fn encoder_mut(&mut self) -> &mut UdpFecEncoder {
+    pub fn encoder_mut(&mut self) -> &mut DatagramFecEncoder {
         &mut self.encoder
     }
 
@@ -445,7 +448,7 @@ impl UdpFecSender {
 #[derive(Debug)]
 pub struct UdpFecReceiver {
     socket: UdpSocket,
-    decoders: HashMap<SocketAddr, UdpFecDecoder>,
+    decoders: HashMap<SocketAddr, DatagramFecDecoder>,
     datagram: Vec<u8>,
 }
 
@@ -479,8 +482,8 @@ impl UdpFecReceiver {
     }
 }
 
-pub fn decode_header(datagram: &[u8]) -> Result<UdpFecHeader, UdpFecError> {
-    UdpFecHeader::decode(datagram)
+pub fn decode_header(datagram: &[u8]) -> Result<DatagramFecHeader, DatagramFecError> {
+    DatagramFecHeader::decode(datagram)
 }
 
 pub fn source_symbol_count(byte_len: usize, symbol_size: u16) -> u16 {
@@ -501,7 +504,7 @@ mod tests {
 
     #[test]
     fn header_roundtrips() {
-        let header = UdpFecHeader {
+        let header = DatagramFecHeader {
             block_id: 7,
             transfer_length: 1024,
             source_symbols: 4,
@@ -509,20 +512,23 @@ mod tests {
         };
         let mut bytes = [0; HEADER_LEN];
         header.encode(&mut bytes).expect("encode header");
-        assert_eq!(UdpFecHeader::decode(&bytes).expect("decode header"), header);
+        assert_eq!(
+            DatagramFecHeader::decode(&bytes).expect("decode header"),
+            header
+        );
     }
 
     #[test]
     fn raptorq_roundtrips_with_one_missing_source_packet() {
         let payload = b"fec-protected-media-payload".repeat(16);
-        let mut encoder = UdpFecEncoder::new()
+        let mut encoder = DatagramFecEncoder::new()
             .with_source_symbols(16)
             .with_symbol_size(64)
             .with_repair_symbols(2);
         let datagrams = encoder.encode_block(&payload).expect("encode block");
         assert!(datagrams.len() > 2);
 
-        let mut decoder = UdpFecDecoder::new();
+        let mut decoder = DatagramFecDecoder::new();
         let mut decoded = None;
         for (index, datagram) in datagrams.iter().enumerate() {
             if index == 1 {
@@ -540,7 +546,7 @@ mod tests {
     #[test]
     fn encode_payload_splits_into_configured_blocks() {
         let payload = vec![42; 100];
-        let mut encoder = UdpFecEncoder::new()
+        let mut encoder = DatagramFecEncoder::new()
             .with_source_symbols(2)
             .with_symbol_size(16)
             .with_repair_symbols(1);
@@ -556,11 +562,11 @@ mod tests {
     #[test]
     fn ignores_duplicate_completed_block_packets() {
         let payload = b"single-block";
-        let mut encoder = UdpFecEncoder::new()
+        let mut encoder = DatagramFecEncoder::new()
             .with_symbol_size(32)
             .with_repair_symbols(1);
         let datagrams = encoder.encode_block(payload).expect("encode block");
-        let mut decoder = UdpFecDecoder::new();
+        let mut decoder = DatagramFecDecoder::new();
         let decoded = decoder
             .push_datagram(&datagrams[0])
             .expect("decode first datagram");

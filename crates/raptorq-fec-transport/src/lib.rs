@@ -1,4 +1,4 @@
-//! Datagram-transport wrappers for `raptor-udp-fec`.
+//! Datagram-transport wrappers for `raptorq-datagram-fec`.
 //!
 //! WebTransport datagrams and WebRTC data-channel messages both provide an
 //! unordered datagram-like surface. This crate keeps the FEC layer independent
@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use raptor_udp_fec::{UdpFecDecoder, UdpFecEncoder, UdpFecError};
+use raptorq_datagram_fec::{DatagramFecDecoder, DatagramFecEncoder, DatagramFecError};
 use std::fmt;
 
 pub const STREAM_ID_PREFIX_LEN: usize = 8;
@@ -56,14 +56,14 @@ impl FecTransportConfig {
 
 #[derive(Debug, Clone)]
 pub struct FecDatagramEncoder {
-    inner: UdpFecEncoder,
+    inner: DatagramFecEncoder,
     stream_id_mode: StreamIdMode,
 }
 
 impl FecDatagramEncoder {
     pub fn new(config: FecTransportConfig) -> Self {
         Self {
-            inner: UdpFecEncoder::new(),
+            inner: DatagramFecEncoder::new(),
             stream_id_mode: config.stream_id_mode,
         }
     }
@@ -76,15 +76,15 @@ impl FecDatagramEncoder {
         Self::new(FecTransportConfig::webrtc())
     }
 
-    pub fn fec_encoder(&self) -> &UdpFecEncoder {
+    pub fn fec_encoder(&self) -> &DatagramFecEncoder {
         &self.inner
     }
 
-    pub fn fec_encoder_mut(&mut self) -> &mut UdpFecEncoder {
+    pub fn fec_encoder_mut(&mut self) -> &mut DatagramFecEncoder {
         &mut self.inner
     }
 
-    pub fn encode_payload(&mut self, payload: &[u8]) -> Result<Vec<Bytes>, UdpFecError> {
+    pub fn encode_payload(&mut self, payload: &[u8]) -> Result<Vec<Bytes>, DatagramFecError> {
         let prefix = self.stream_id_mode.prefix();
         self.inner
             .encode_payload(payload)?
@@ -96,14 +96,14 @@ impl FecDatagramEncoder {
 
 #[derive(Debug)]
 pub struct FecDatagramDecoder {
-    inner: UdpFecDecoder,
+    inner: DatagramFecDecoder,
     stream_id_mode: StreamIdMode,
 }
 
 impl FecDatagramDecoder {
     pub fn new(config: FecTransportConfig) -> Self {
         Self {
-            inner: UdpFecDecoder::new(),
+            inner: DatagramFecDecoder::new(),
             stream_id_mode: config.stream_id_mode,
         }
     }
@@ -203,7 +203,7 @@ pub type WebRtcFecSender<T> = FecDatagramSender<T>;
 pub enum FecTransportError {
     MissingStreamIdPrefix,
     UnexpectedStreamId { expected: u64, actual: u64 },
-    Fec(UdpFecError),
+    Fec(DatagramFecError),
 }
 
 impl fmt::Display for FecTransportError {
@@ -223,7 +223,7 @@ impl std::error::Error for FecTransportError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FecSendError<T> {
-    Fec(UdpFecError),
+    Fec(DatagramFecError),
     Transport(T),
 }
 

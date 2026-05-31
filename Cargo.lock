@@ -61,16 +61,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "raptor-fec-transport"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "raptor-udp-fec",
-]
+name = "raptorq"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
-name = "raptor-udp-fec"
+name = "raptorq-datagram-fec"
 version = "0.1.0"
 dependencies = [
  "raptorq",
@@ -78,10 +75,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "raptorq"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
+name = "raptorq-fec-transport"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "raptorq-datagram-fec",
+]
 
 [[package]]
 name = "socket2"

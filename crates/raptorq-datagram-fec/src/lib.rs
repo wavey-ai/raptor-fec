@@ -1,8 +1,23 @@
 //! RaptorQ forward-error-correction framing for low-latency datagrams.
 //!
 //! The crate keeps the wire protocol intentionally small: every datagram starts
-//! with a 12-byte little-endian header followed by a serialized RaptorQ
+//! with a self-identifying v2 header followed by a serialized RaptorQ
 //! `EncodingPacket`.
+
+mod adaptive;
+mod media;
+mod sequence;
+
+pub use adaptive::{
+    AdaptiveFecController, AdaptiveFecPolicy, CongestionConfig, CongestionDecision, FecDecision,
+    MediaPriority, NetworkMetrics,
+};
+pub use media::{
+    decode_serialized_media_access_unit, DecodedMediaFrame, EncodedMediaFrame, MediaCodec,
+    MediaFecDecoder, MediaFecEncoder, MediaFecError, MediaFragmentHeader, MediaFrame,
+    MediaFrameFlags, MediaFrameMetadata, SerializedMediaAccessUnit, MEDIA_FRAME_HEADER_LEN,
+};
+pub use sequence::{SequenceObservation, SequenceStats, SequenceTracker};
 
 use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation};
 use std::collections::{HashMap, HashSet};
@@ -14,8 +29,17 @@ use std::net::SocketAddr;
 #[cfg(feature = "udp")]
 use tokio::net::UdpSocket;
 
+/// Four-byte magic prefix carried by every Wavey RaptorQ datagram.
+pub const DATAGRAM_MAGIC: [u8; 4] = *b"RQD2";
+/// Current Wavey RaptorQ datagram wire version.
+pub const DATAGRAM_VERSION: u8 = 2;
+/// RaptorQ encoding-packet datagram kind.
+pub const DATAGRAM_KIND_RAPTORQ: u8 = 1;
+/// Packet CRC32 is present and must verify against the header prefix and payload.
+pub const DATAGRAM_FLAG_PACKET_CRC32: u8 = 1 << 0;
+const SUPPORTED_PACKET_FLAGS: u8 = DATAGRAM_FLAG_PACKET_CRC32;
 /// Bytes in the per-datagram header.
-pub const HEADER_LEN: usize = 12;
+pub const HEADER_LEN: usize = 32;
 /// Bytes in RaptorQ's serialized encoding-packet header.
 pub const ENCODING_PACKET_HEADER_LEN: usize = 4;
 /// Default symbol size, chosen to fit typical Ethernet MTU after IP/UDP headers.
@@ -55,27 +79,60 @@ impl DatagramFecConfig {
     }
 }
 
-/// The 12-byte prefix carried by every encoded datagram.
+/// The v2 prefix carried by every encoded datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatagramFecHeader {
+    pub packet_kind: u8,
+    pub packet_flags: u8,
     pub block_id: u32,
     pub transfer_length: u32,
+    pub packet_sequence: u32,
     pub source_symbols: u16,
     pub symbol_size: u16,
+    pub payload_len: u32,
+    pub packet_crc32: u32,
 }
 
 impl DatagramFecHeader {
+    pub fn raptorq(
+        block_id: u32,
+        transfer_length: u32,
+        packet_sequence: u32,
+        source_symbols: u16,
+        symbol_size: u16,
+        payload: &[u8],
+    ) -> Result<Self, DatagramFecError> {
+        if payload.len() > u32::MAX as usize {
+            return Err(DatagramFecError::PayloadTooLong {
+                actual: payload.len(),
+            });
+        }
+
+        let mut header = Self {
+            packet_kind: DATAGRAM_KIND_RAPTORQ,
+            packet_flags: DATAGRAM_FLAG_PACKET_CRC32,
+            block_id,
+            transfer_length,
+            packet_sequence,
+            source_symbols,
+            symbol_size,
+            payload_len: payload.len() as u32,
+            packet_crc32: 0,
+        };
+        header.packet_crc32 = header.compute_packet_crc32(payload)?;
+        Ok(header)
+    }
+
     pub fn encode(&self, bytes: &mut [u8]) -> Result<(), DatagramFecError> {
         if bytes.len() < HEADER_LEN {
             return Err(DatagramFecError::HeaderTooShort {
                 actual: bytes.len(),
             });
         }
+        self.validate_fields()?;
 
-        bytes[0..4].copy_from_slice(&self.block_id.to_le_bytes());
-        bytes[4..8].copy_from_slice(&self.transfer_length.to_le_bytes());
-        bytes[8..10].copy_from_slice(&self.source_symbols.to_le_bytes());
-        bytes[10..12].copy_from_slice(&self.symbol_size.to_le_bytes());
+        self.encode_prefix(bytes)?;
+        bytes[28..32].copy_from_slice(&self.packet_crc32.to_le_bytes());
         Ok(())
     }
 
@@ -86,26 +143,90 @@ impl DatagramFecHeader {
             });
         }
 
+        let magic: [u8; 4] = bytes[0..4].try_into().expect("header length checked");
+        if magic != DATAGRAM_MAGIC {
+            return Err(DatagramFecError::InvalidMagic { actual: magic });
+        }
+
+        let version = bytes[4];
+        if version != DATAGRAM_VERSION {
+            return Err(DatagramFecError::UnsupportedVersion(version));
+        }
+
+        let header_len = bytes[5];
+        if usize::from(header_len) != HEADER_LEN {
+            return Err(DatagramFecError::UnsupportedHeaderLength(header_len));
+        }
+
+        let packet_kind = bytes[6];
+        let packet_flags = bytes[7];
         let source_symbols =
-            u16::from_le_bytes(bytes[8..10].try_into().expect("header length checked"));
+            u16::from_le_bytes(bytes[20..22].try_into().expect("header length checked"));
         let symbol_size =
-            u16::from_le_bytes(bytes[10..12].try_into().expect("header length checked"));
+            u16::from_le_bytes(bytes[22..24].try_into().expect("header length checked"));
 
-        if source_symbols == 0 {
-            return Err(DatagramFecError::InvalidSourceSymbols(source_symbols));
-        }
-        if symbol_size == 0 {
-            return Err(DatagramFecError::InvalidSymbolSize(symbol_size));
-        }
-
-        Ok(Self {
-            block_id: u32::from_le_bytes(bytes[0..4].try_into().expect("header length checked")),
+        let header = Self {
+            packet_kind,
+            packet_flags,
+            block_id: u32::from_le_bytes(bytes[8..12].try_into().expect("header length checked")),
             transfer_length: u32::from_le_bytes(
-                bytes[4..8].try_into().expect("header length checked"),
+                bytes[12..16].try_into().expect("header length checked"),
+            ),
+            packet_sequence: u32::from_le_bytes(
+                bytes[16..20].try_into().expect("header length checked"),
             ),
             source_symbols,
             symbol_size,
-        })
+            payload_len: u32::from_le_bytes(
+                bytes[24..28].try_into().expect("header length checked"),
+            ),
+            packet_crc32: u32::from_le_bytes(
+                bytes[28..32].try_into().expect("header length checked"),
+            ),
+        };
+        header.validate_fields()?;
+        Ok(header)
+    }
+
+    pub fn payload<'a>(&self, datagram: &'a [u8]) -> Result<&'a [u8], DatagramFecError> {
+        if datagram.len() < HEADER_LEN {
+            return Err(DatagramFecError::HeaderTooShort {
+                actual: datagram.len(),
+            });
+        }
+
+        let expected = self.payload_len as usize;
+        let actual = datagram.len() - HEADER_LEN;
+        if actual != expected {
+            return Err(DatagramFecError::PayloadLengthMismatch { expected, actual });
+        }
+
+        let payload = &datagram[HEADER_LEN..];
+        if self.packet_flags & DATAGRAM_FLAG_PACKET_CRC32 != 0 {
+            let actual_crc32 = self.compute_packet_crc32(payload)?;
+            if actual_crc32 != self.packet_crc32 {
+                return Err(DatagramFecError::PacketCrc32Mismatch {
+                    expected: self.packet_crc32,
+                    actual: actual_crc32,
+                });
+            }
+        }
+
+        Ok(payload)
+    }
+
+    pub fn compute_packet_crc32(&self, payload: &[u8]) -> Result<u32, DatagramFecError> {
+        let expected_len = self.payload_len as usize;
+        if payload.len() != expected_len {
+            return Err(DatagramFecError::PayloadLengthMismatch {
+                expected: expected_len,
+                actual: payload.len(),
+            });
+        }
+
+        let mut prefix = [0u8; HEADER_LEN - 4];
+        self.encode_prefix(&mut prefix)?;
+        Ok(packet_crc32(&prefix, payload))
     }
 
     pub fn datagram_size(&self) -> usize {
@@ -115,14 +236,59 @@ impl DatagramFecHeader {
     fn oti(&self) -> ObjectTransmissionInformation {
         ObjectTransmissionInformation::with_defaults(self.transfer_length as u64, self.symbol_size)
     }
+
+    fn encode_prefix(&self, bytes: &mut [u8]) -> Result<(), DatagramFecError> {
+        if bytes.len() < HEADER_LEN - 4 {
+            return Err(DatagramFecError::HeaderTooShort {
+                actual: bytes.len(),
+            });
+        }
+        self.validate_fields()?;
+
+        bytes[0..4].copy_from_slice(&DATAGRAM_MAGIC);
+        bytes[4] = DATAGRAM_VERSION;
+        bytes[5] = HEADER_LEN as u8;
+        bytes[6] = self.packet_kind;
+        bytes[7] = self.packet_flags;
+        bytes[8..12].copy_from_slice(&self.block_id.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.transfer_length.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.packet_sequence.to_le_bytes());
+        bytes[20..22].copy_from_slice(&self.source_symbols.to_le_bytes());
+        bytes[22..24].copy_from_slice(&self.symbol_size.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.payload_len.to_le_bytes());
+        Ok(())
+    }
+
+    fn validate_fields(&self) -> Result<(), DatagramFecError> {
+        if self.packet_kind != DATAGRAM_KIND_RAPTORQ {
+            return Err(DatagramFecError::UnsupportedPacketKind(self.packet_kind));
+        }
+        if self.packet_flags & !SUPPORTED_PACKET_FLAGS != 0 {
+            return Err(DatagramFecError::UnsupportedPacketFlags(self.packet_flags));
+        }
+        if self.source_symbols == 0 {
+            return Err(DatagramFecError::InvalidSourceSymbols(self.source_symbols));
+        }
+        if self.symbol_size == 0 {
+            return Err(DatagramFecError::InvalidSymbolSize(self.symbol_size));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatagramFecError {
     HeaderTooShort { actual: usize },
     PacketTooShort { actual: usize },
+    InvalidMagic { actual: [u8; 4] },
+    UnsupportedVersion(u8),
+    UnsupportedHeaderLength(u8),
+    UnsupportedPacketKind(u8),
+    UnsupportedPacketFlags(u8),
     InvalidSourceSymbols(u16),
     InvalidSymbolSize(u16),
+    PayloadLengthMismatch { expected: usize, actual: usize },
+    PacketCrc32Mismatch { expected: u32, actual: u32 },
     PayloadTooLong { actual: usize },
     PayloadTooLargeForBlock { actual: usize, max: usize },
 }
@@ -143,6 +309,37 @@ impl fmt::Display for DatagramFecError {
                     HEADER_LEN + ENCODING_PACKET_HEADER_LEN
                 )
             }
+            Self::InvalidMagic { actual } => {
+                write!(
+                    formatter,
+                    "invalid datagram FEC magic: expected {:?}, got {:?}",
+                    DATAGRAM_MAGIC, actual
+                )
+            }
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported datagram FEC version: expected {DATAGRAM_VERSION}, got {version}"
+                )
+            }
+            Self::UnsupportedHeaderLength(header_len) => {
+                write!(
+                    formatter,
+                    "unsupported datagram FEC header length: expected {HEADER_LEN}, got {header_len}"
+                )
+            }
+            Self::UnsupportedPacketKind(packet_kind) => {
+                write!(
+                    formatter,
+                    "unsupported datagram FEC packet kind: {packet_kind}"
+                )
+            }
+            Self::UnsupportedPacketFlags(packet_flags) => {
+                write!(
+                    formatter,
+                    "unsupported datagram FEC packet flags: {packet_flags:#04x}"
+                )
+            }
             Self::InvalidSourceSymbols(value) => {
                 write!(
                     formatter,
@@ -151,6 +348,18 @@ impl fmt::Display for DatagramFecError {
             }
             Self::InvalidSymbolSize(value) => {
                 write!(formatter, "invalid datagram FEC symbol size: {value}")
+            }
+            Self::PayloadLengthMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "datagram FEC payload length mismatch: expected {expected} bytes, got {actual}"
+                )
+            }
+            Self::PacketCrc32Mismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "datagram FEC packet CRC32 mismatch: expected {expected:#010x}, got {actual:#010x}"
+                )
             }
             Self::PayloadTooLong { actual } => {
                 write!(
@@ -170,10 +379,33 @@ impl fmt::Display for DatagramFecError {
 
 impl std::error::Error for DatagramFecError {}
 
+pub fn crc32_ieee(bytes: &[u8]) -> u32 {
+    crc32_ieee_update(0, bytes)
+}
+
+pub fn crc32_ieee_update(previous: u32, bytes: &[u8]) -> u32 {
+    let mut crc = !previous;
+
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+
+    !crc
+}
+
+pub fn packet_crc32(header_without_crc: &[u8], payload: &[u8]) -> u32 {
+    crc32_ieee_update(crc32_ieee(header_without_crc), payload)
+}
+
 /// Stateful RaptorQ encoder that assigns monotonically increasing block ids.
 #[derive(Debug, Clone)]
 pub struct DatagramFecEncoder {
     block_id: u32,
+    packet_sequence: u32,
     config: DatagramFecConfig,
 }
 
@@ -187,6 +419,7 @@ impl DatagramFecEncoder {
     pub fn new() -> Self {
         Self {
             block_id: 0,
+            packet_sequence: 0,
             config: DatagramFecConfig::default(),
         }
     }
@@ -222,6 +455,19 @@ impl DatagramFecEncoder {
         self.block_id
     }
 
+    pub fn packet_sequence(&self) -> u32 {
+        self.packet_sequence
+    }
+
+    pub fn with_initial_block_id(mut self, block_id: u32) -> Self {
+        self.block_id = block_id;
+        self
+    }
+
+    pub fn set_block_id(&mut self, block_id: u32) {
+        self.block_id = block_id;
+    }
+
     pub fn config(&self) -> DatagramFecConfig {
         self.config
     }
@@ -240,6 +486,34 @@ impl DatagramFecEncoder {
 
     /// Encode exactly one configured FEC block.
     pub fn encode_block(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        self.encode_block_with_repair_symbols(data, self.config.repair_symbols)
+    }
+
+    /// Encode one complete application object, even when it needs more source
+    /// symbols than the configured low-latency block size.
+    pub fn encode_object(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        self.encode_object_with_repair_symbols(data, self.config.repair_symbols)
+    }
+
+    /// Encode one complete application object with a caller-selected repair count.
+    pub fn encode_object_with_repair_symbols(
+        &mut self,
+        data: &[u8],
+        repair_symbols: u32,
+    ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        if data.len() > u32::MAX as usize {
+            return Err(DatagramFecError::PayloadTooLong { actual: data.len() });
+        }
+
+        self.encode_one_block_with_repair_symbols(data, repair_symbols)
+    }
+
+    /// Encode exactly one FEC block with a caller-selected repair count.
+    pub fn encode_block_with_repair_symbols(
+        &mut self,
+        data: &[u8],
+        repair_symbols: u32,
+    ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
         if data.len() > u32::MAX as usize {
             return Err(DatagramFecError::PayloadTooLong { actual: data.len() });
         }
@@ -252,7 +526,7 @@ impl DatagramFecEncoder {
             });
         }
 
-        self.encode_one_block(data)
+        self.encode_one_block_with_repair_symbols(data, repair_symbols)
     }
 
     /// Split `data` into configured block-sized chunks and encode all chunks.
@@ -275,24 +549,39 @@ impl DatagramFecEncoder {
     }
 
     fn encode_one_block(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        self.encode_one_block_with_repair_symbols(data, self.config.repair_symbols)
+    }
+
+    fn encode_one_block_with_repair_symbols(
+        &mut self,
+        data: &[u8],
+        repair_symbols: u32,
+    ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
         let encoder = Encoder::with_defaults(data, self.config.symbol_size);
         let raptor_config = encoder.get_config();
-        let packets = encoder.get_encoded_packets(self.config.repair_symbols);
-        let header = DatagramFecHeader {
-            block_id: self.block_id,
-            transfer_length: data.len() as u32,
-            source_symbols: source_symbol_count(data.len(), raptor_config.symbol_size()),
-            symbol_size: raptor_config.symbol_size(),
-        };
+        let packets = encoder.get_encoded_packets(repair_symbols);
+        let block_id = self.block_id;
+        let transfer_length = data.len() as u32;
+        let source_symbols = source_symbol_count(data.len(), raptor_config.symbol_size());
+        let symbol_size = raptor_config.symbol_size();
 
         let mut datagrams = Vec::with_capacity(packets.len());
         for packet in packets {
             let serialized = packet.serialize();
+            let header = DatagramFecHeader::raptorq(
+                block_id,
+                transfer_length,
+                self.packet_sequence,
+                source_symbols,
+                symbol_size,
+                &serialized,
+            )?;
             let mut datagram = Vec::with_capacity(HEADER_LEN + serialized.len());
             datagram.resize(HEADER_LEN, 0);
             header.encode(&mut datagram[..HEADER_LEN])?;
             datagram.extend_from_slice(&serialized);
             datagrams.push(datagram);
+            self.packet_sequence = self.packet_sequence.wrapping_add(1);
         }
 
         self.block_id = self.block_id.wrapping_add(1);
@@ -310,6 +599,7 @@ struct BlockState {
 pub struct DatagramFecDecoder {
     blocks: HashMap<u32, BlockState>,
     completed: HashSet<u32>,
+    sequence_tracker: SequenceTracker,
 }
 
 impl DatagramFecDecoder {
@@ -325,11 +615,18 @@ impl DatagramFecDecoder {
         }
 
         let header = DatagramFecHeader::decode(datagram)?;
+        let payload = header.payload(datagram)?;
+        if payload.len() < ENCODING_PACKET_HEADER_LEN {
+            return Err(DatagramFecError::PacketTooShort {
+                actual: datagram.len(),
+            });
+        }
+        self.sequence_tracker.observe(header.packet_sequence);
         if self.completed.contains(&header.block_id) {
             return Ok(None);
         }
 
-        let packet = EncodingPacket::deserialize(&datagram[HEADER_LEN..]);
+        let packet = EncodingPacket::deserialize(payload);
         let block = self
             .blocks
             .entry(header.block_id)
@@ -345,6 +642,10 @@ impl DatagramFecDecoder {
         self.completed.insert(header.block_id);
         self.prune(header.block_id);
         Ok(Some(decoded))
+    }
+
+    pub fn sequence_stats(&self) -> SequenceStats {
+        self.sequence_tracker.stats()
     }
 
     fn prune(&mut self, current_block_id: u32) {
@@ -504,18 +805,100 @@ mod tests {
 
     #[test]
     fn header_roundtrips() {
-        let header = DatagramFecHeader {
-            block_id: 7,
-            transfer_length: 1024,
-            source_symbols: 4,
-            symbol_size: 256,
-        };
+        let payload = b"serialized-raptorq-packet";
+        let header = DatagramFecHeader::raptorq(7, 1024, 99, 4, 256, payload).expect("header");
         let mut bytes = [0; HEADER_LEN];
         header.encode(&mut bytes).expect("encode header");
+        assert_eq!(&bytes[0..4], &DATAGRAM_MAGIC);
+        assert_eq!(bytes[4], DATAGRAM_VERSION);
+        assert_eq!(bytes[5], HEADER_LEN as u8);
         assert_eq!(
             DatagramFecHeader::decode(&bytes).expect("decode header"),
             header
         );
+        assert_eq!(
+            header.compute_packet_crc32(payload).expect("packet crc"),
+            header.packet_crc32
+        );
+    }
+
+    #[test]
+    fn crc32_ieee_uses_standard_vector() {
+        assert_eq!(crc32_ieee(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn header_rejects_wrong_magic() {
+        let payload = b"serialized-raptorq-packet";
+        let header = DatagramFecHeader::raptorq(7, 1024, 99, 4, 256, payload).expect("header");
+        let mut bytes = [0; HEADER_LEN];
+        header.encode(&mut bytes).expect("encode header");
+        bytes[0] = 0;
+
+        assert!(matches!(
+            DatagramFecHeader::decode(&bytes),
+            Err(DatagramFecError::InvalidMagic { .. })
+        ));
+    }
+
+    #[test]
+    fn encoded_datagrams_have_v2_payload_metadata() {
+        let payload = b"fec-protected-media-payload".repeat(2);
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(64)
+            .with_repair_symbols(1);
+        let datagrams = encoder.encode_block(&payload).expect("encode block");
+        let datagram = &datagrams[0];
+        let header = decode_header(datagram).expect("header");
+
+        assert_eq!(header.packet_kind, DATAGRAM_KIND_RAPTORQ);
+        assert_eq!(header.packet_flags, DATAGRAM_FLAG_PACKET_CRC32);
+        assert_eq!(header.payload_len as usize, datagram.len() - HEADER_LEN);
+        assert_eq!(
+            header
+                .compute_packet_crc32(&datagram[HEADER_LEN..])
+                .expect("packet crc"),
+            header.packet_crc32
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_payload_length_mismatch() {
+        let payload = b"fec-protected-media-payload";
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(64)
+            .with_repair_symbols(1);
+        let mut datagram = encoder
+            .encode_block(payload)
+            .expect("encode block")
+            .remove(0);
+        datagram.push(0);
+
+        let mut decoder = DatagramFecDecoder::new();
+        assert!(matches!(
+            decoder.push_datagram(&datagram),
+            Err(DatagramFecError::PayloadLengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_packet_crc_mismatch() {
+        let payload = b"fec-protected-media-payload";
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(64)
+            .with_repair_symbols(1);
+        let mut datagram = encoder
+            .encode_block(payload)
+            .expect("encode block")
+            .remove(0);
+        let last = datagram.last_mut().expect("payload byte");
+        *last ^= 0x01;
+
+        let mut decoder = DatagramFecDecoder::new();
+        assert!(matches!(
+            decoder.push_datagram(&datagram),
+            Err(DatagramFecError::PacketCrc32Mismatch { .. })
+        ));
     }
 
     #[test]
@@ -575,5 +958,47 @@ mod tests {
             .push_datagram(&datagrams[1])
             .expect("ignore duplicate block packet");
         assert!(duplicate.is_none());
+    }
+
+    #[test]
+    fn header_sequences_are_monotonic() {
+        let mut encoder = DatagramFecEncoder::new()
+            .with_symbol_size(16)
+            .with_repair_symbols(1);
+        let datagrams = encoder.encode_block(&[7; 48]).expect("encode block");
+        let sequences = datagrams
+            .iter()
+            .map(|datagram| decode_header(datagram).expect("header").packet_sequence)
+            .collect::<Vec<_>>();
+
+        assert_eq!(sequences, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn object_encoding_keeps_large_payloads_in_one_decoded_block() {
+        let payload = vec![0x35; 4096];
+        let mut encoder = DatagramFecEncoder::new()
+            .with_source_symbols(2)
+            .with_symbol_size(64)
+            .with_repair_symbols(1)
+            .with_initial_block_id(100);
+        let datagrams = encoder.encode_object(&payload).expect("encode object");
+        let block_ids = datagrams
+            .iter()
+            .map(|datagram| decode_header(datagram).expect("header").block_id)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(block_ids, HashSet::from([100]));
+
+        let mut decoder = DatagramFecDecoder::new();
+        let mut decoded = None;
+        for datagram in datagrams {
+            decoded = decoder.push_datagram(&datagram).expect("decode datagram");
+            if decoded.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(decoded, Some(payload));
     }
 }

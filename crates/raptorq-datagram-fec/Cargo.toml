@@ -12,5 +12,6 @@ default = ["udp"]
 udp = ["dep:tokio"]
 
 [dependencies]
+bytes.workspace = true
 raptorq.workspace = true
 tokio = { workspace = true, optional = true, features = ["net"] }

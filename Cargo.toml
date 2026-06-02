@@ -16,5 +16,5 @@ authors = ["Wavey AI"]
 async-trait = "0.1.88"
 bytes = "1.5"
 raptorq-datagram-fec = { path = "crates/raptorq-datagram-fec", version = "0.1.0", default-features = false }
-raptorq = "2"
+raptorq = { version = "2", default-features = false }
 tokio = { version = "1.45", default-features = false }

@@ -6,7 +6,10 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use raptorq_datagram_fec::{DatagramFecDecoder, DatagramFecEncoder, DatagramFecError};
+use raptorq_datagram_fec::{
+    DatagramFecDecoder, DatagramFecEncoder, DatagramFecError, DecodedMediaFrame, FecDecision,
+    MediaFecDecoder, MediaFecEncoder, MediaFecError, MediaFrame, SequenceStats,
+};
 use std::fmt;
 
 pub const STREAM_ID_PREFIX_LEN: usize = 8;
@@ -39,7 +42,14 @@ pub struct FecTransportConfig {
 }
 
 impl FecTransportConfig {
-    pub fn webtransport(stream_id: u64) -> Self {
+    pub fn webtransport() -> Self {
+        Self {
+            kind: FecTransportKind::WebTransport,
+            stream_id_mode: StreamIdMode::None,
+        }
+    }
+
+    pub fn webtransport_with_stream_prefix(stream_id: u64) -> Self {
         Self {
             kind: FecTransportKind::WebTransport,
             stream_id_mode: StreamIdMode::Prefix64Be(stream_id),
@@ -68,8 +78,14 @@ impl FecDatagramEncoder {
         }
     }
 
-    pub fn webtransport(stream_id: u64) -> Self {
-        Self::new(FecTransportConfig::webtransport(stream_id))
+    pub fn webtransport() -> Self {
+        Self::new(FecTransportConfig::webtransport())
+    }
+
+    pub fn webtransport_with_stream_prefix(stream_id: u64) -> Self {
+        Self::new(FecTransportConfig::webtransport_with_stream_prefix(
+            stream_id,
+        ))
     }
 
     pub fn webrtc() -> Self {
@@ -92,6 +108,33 @@ impl FecDatagramEncoder {
             .map(|datagram| Ok(Bytes::from(add_prefix(prefix, datagram))))
             .collect()
     }
+
+    pub fn encode_media_frame(
+        &self,
+        media: &mut MediaFecEncoder,
+        frame: MediaFrame<'_>,
+    ) -> Result<EncodedTransportMediaFrame, MediaFecError> {
+        let prefix = self.stream_id_mode.prefix();
+        let encoded = media.encode_frame(frame)?;
+        Ok(EncodedTransportMediaFrame {
+            sequence: encoded.sequence,
+            fragment_count: encoded.fragment_count,
+            decision: encoded.decision,
+            datagrams: encoded
+                .datagrams
+                .into_iter()
+                .map(|datagram| Bytes::from(add_prefix(prefix, datagram)))
+                .collect(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EncodedTransportMediaFrame {
+    pub sequence: u64,
+    pub fragment_count: u16,
+    pub decision: FecDecision,
+    pub datagrams: Vec<Bytes>,
 }
 
 #[derive(Debug)]
@@ -108,8 +151,14 @@ impl FecDatagramDecoder {
         }
     }
 
-    pub fn webtransport(stream_id: u64) -> Self {
-        Self::new(FecTransportConfig::webtransport(stream_id))
+    pub fn webtransport() -> Self {
+        Self::new(FecTransportConfig::webtransport())
+    }
+
+    pub fn webtransport_with_stream_prefix(stream_id: u64) -> Self {
+        Self::new(FecTransportConfig::webtransport_with_stream_prefix(
+            stream_id,
+        ))
     }
 
     pub fn webrtc() -> Self {
@@ -117,8 +166,36 @@ impl FecDatagramDecoder {
     }
 
     pub fn push_datagram(&mut self, datagram: &[u8]) -> Result<Option<Vec<u8>>, FecTransportError> {
-        let payload = match self.stream_id_mode {
-            StreamIdMode::None => datagram,
+        let payload = self.strip_transport_prefix(datagram)?;
+
+        self.inner
+            .push_datagram(payload)
+            .map_err(FecTransportError::Fec)
+    }
+
+    pub fn push_media_datagram(
+        &self,
+        media: &mut MediaFecDecoder,
+        datagram: &[u8],
+    ) -> Result<Option<DecodedMediaFrame>, FecTransportMediaError> {
+        let payload = self
+            .strip_transport_prefix(datagram)
+            .map_err(FecTransportMediaError::Transport)?;
+        media
+            .push_datagram(payload)
+            .map_err(FecTransportMediaError::Media)
+    }
+
+    pub fn sequence_stats(&self) -> SequenceStats {
+        self.inner.sequence_stats()
+    }
+
+    fn strip_transport_prefix<'a>(
+        &self,
+        datagram: &'a [u8],
+    ) -> Result<&'a [u8], FecTransportError> {
+        match self.stream_id_mode {
+            StreamIdMode::None => Ok(datagram),
             StreamIdMode::Prefix64Be(expected) => {
                 let (stream_id, payload) = split_stream_id_prefix(datagram)
                     .ok_or(FecTransportError::MissingStreamIdPrefix)?;
@@ -128,13 +205,9 @@ impl FecDatagramDecoder {
                         actual: stream_id,
                     });
                 }
-                payload
+                Ok(payload)
             }
-        };
-
-        self.inner
-            .push_datagram(payload)
-            .map_err(FecTransportError::Fec)
+        }
     }
 }
 
@@ -222,6 +295,23 @@ impl fmt::Display for FecTransportError {
 impl std::error::Error for FecTransportError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FecTransportMediaError {
+    Transport(FecTransportError),
+    Media(MediaFecError),
+}
+
+impl fmt::Display for FecTransportMediaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => write!(formatter, "{error}"),
+            Self::Media(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for FecTransportMediaError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FecSendError<T> {
     Fec(DatagramFecError),
     Transport(T),
@@ -276,6 +366,10 @@ fn add_prefix(prefix: Option<[u8; STREAM_ID_PREFIX_LEN]>, datagram: Vec<u8>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raptorq_datagram_fec::{
+        AdaptiveFecController, AdaptiveFecPolicy, CongestionConfig, MediaCodec, MediaFrameFlags,
+        MediaFrameMetadata,
+    };
 
     #[test]
     fn stream_id_prefix_is_big_endian() {
@@ -284,15 +378,20 @@ mod tests {
     }
 
     #[test]
-    fn webtransport_codec_roundtrips_with_prefixed_datagrams() {
+    fn webtransport_codec_roundtrips_without_per_datagram_stream_prefix() {
         let payload = b"fec over webtransport".repeat(32);
-        let mut encoder = FecDatagramEncoder::webtransport(42);
+        let mut encoder = FecDatagramEncoder::webtransport();
         encoder.fec_encoder_mut().set_source_symbols(32);
         encoder.fec_encoder_mut().set_symbol_size(64);
         encoder.fec_encoder_mut().set_repair_symbols(2);
 
         let datagrams = encoder.encode_payload(&payload).expect("encode");
-        let mut decoder = FecDatagramDecoder::webtransport(42);
+        assert_ne!(
+            &datagrams[0][..STREAM_ID_PREFIX_LEN],
+            encode_stream_id_prefix(42)
+        );
+
+        let mut decoder = FecDatagramDecoder::webtransport();
         let mut decoded = None;
         for (index, datagram) in datagrams.iter().enumerate() {
             if index == 1 {
@@ -305,6 +404,25 @@ mod tests {
         }
 
         assert_eq!(decoded, Some(payload));
+        assert!(decoder.sequence_stats().missing >= 1);
+    }
+
+    #[test]
+    fn explicit_stream_prefix_roundtrips_when_requested() {
+        let payload = b"fec with explicit stream prefix";
+        let mut encoder = FecDatagramEncoder::webtransport_with_stream_prefix(42);
+        let datagrams = encoder.encode_payload(payload).expect("encode");
+        assert_eq!(
+            &datagrams[0][..STREAM_ID_PREFIX_LEN],
+            encode_stream_id_prefix(42)
+        );
+
+        let mut decoder = FecDatagramDecoder::webtransport_with_stream_prefix(42);
+        let decoded = decoder
+            .push_datagram(&datagrams[0])
+            .expect("decode")
+            .expect("decoded payload");
+        assert_eq!(decoded, payload);
     }
 
     #[test]
@@ -320,5 +438,65 @@ mod tests {
             .expect("decode")
             .expect("decoded payload");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn webtransport_media_frame_roundtrips_without_stream_prefix() {
+        let policy = AdaptiveFecPolicy {
+            min_source_symbols: 4,
+            max_source_symbols: 4,
+            min_repair_symbols: 1,
+            max_repair_symbols: 4,
+            min_repair_ratio: 0.25,
+            max_repair_ratio: 0.5,
+            symbol_size: 96,
+            ..AdaptiveFecPolicy::default()
+        };
+        let controller = AdaptiveFecController::new(policy, CongestionConfig::default());
+        let mut media_encoder = MediaFecEncoder::new(controller);
+        let transport_encoder = FecDatagramEncoder::webtransport();
+        let payload = vec![0x42; 900];
+        let metadata = MediaFrameMetadata {
+            flags: MediaFrameFlags::keyframe(),
+            ..MediaFrameMetadata::new(
+                3,
+                media_encoder.allocate_sequence(),
+                1_000,
+                MediaCodec::H264,
+            )
+        };
+
+        let encoded = transport_encoder
+            .encode_media_frame(
+                &mut media_encoder,
+                MediaFrame {
+                    metadata,
+                    payload: &payload,
+                },
+            )
+            .expect("encode media frame");
+        assert_ne!(
+            &encoded.datagrams[0][..STREAM_ID_PREFIX_LEN],
+            &encode_stream_id_prefix(3)
+        );
+
+        let transport_decoder = FecDatagramDecoder::webtransport();
+        let mut media_decoder = MediaFecDecoder::new();
+        let mut decoded = None;
+        for (index, datagram) in encoded.datagrams.iter().enumerate() {
+            if index == 1 {
+                continue;
+            }
+            decoded = transport_decoder
+                .push_media_datagram(&mut media_decoder, datagram)
+                .expect("decode media datagram");
+            if decoded.is_some() {
+                break;
+            }
+        }
+
+        let decoded = decoded.expect("complete media frame");
+        assert_eq!(decoded.metadata, metadata);
+        assert_eq!(decoded.payload, payload);
     }
 }

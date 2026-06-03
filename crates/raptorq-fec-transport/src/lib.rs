@@ -7,8 +7,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use raptorq_datagram_fec::{
-    DatagramFecDecoder, DatagramFecEncoder, DatagramFecError, DecodedMediaFrame, FecDecision,
-    MediaFecDecoder, MediaFecEncoder, MediaFecError, MediaFrame, SequenceStats,
+    DatagramFecDecoder, DatagramFecEncoder, DatagramFecError, DecodedMediaFrame, EncodedMediaBlock,
+    FecDecision, MediaFecDecoder, MediaFecEncoder, MediaFecError, MediaFrame, SequenceStats,
 };
 use std::fmt;
 
@@ -120,6 +120,7 @@ impl FecDatagramEncoder {
             sequence: encoded.sequence,
             fragment_count: encoded.fragment_count,
             decision: encoded.decision,
+            blocks: encoded.blocks,
             datagrams: encoded
                 .datagrams
                 .into_iter()
@@ -134,6 +135,7 @@ pub struct EncodedTransportMediaFrame {
     pub sequence: u64,
     pub fragment_count: u16,
     pub decision: FecDecision,
+    pub blocks: Vec<EncodedMediaBlock>,
     pub datagrams: Vec<Bytes>,
 }
 
@@ -479,6 +481,20 @@ mod tests {
             &encoded.datagrams[0][..STREAM_ID_PREFIX_LEN],
             &encode_stream_id_prefix(3)
         );
+        assert_eq!(encoded.blocks.len(), usize::from(encoded.fragment_count));
+        assert!(encoded.blocks.len() > 1);
+        for block in &encoded.blocks {
+            assert!(block.source_symbols >= 1);
+            assert!(block.source_symbols <= policy.max_source_symbols);
+            assert_eq!(
+                block.source_datagram_indices().count(),
+                usize::from(block.source_symbols)
+            );
+            assert_eq!(
+                block.repair_datagram_indices().count(),
+                block.repair_symbols as usize
+            );
+        }
 
         let transport_decoder = FecDatagramDecoder::webtransport();
         let mut media_decoder = MediaFecDecoder::new();

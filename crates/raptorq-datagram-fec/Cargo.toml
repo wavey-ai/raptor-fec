@@ -1,6 +1,6 @@
 [package]
 name = "raptorq-datagram-fec"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 description = "RaptorQ FEC framing for low-latency datagram transports."
 repository.workspace = true
@@ -15,3 +15,7 @@ udp = ["dep:tokio"]
 bytes.workspace = true
 raptorq.workspace = true
 tokio = { workspace = true, optional = true, features = ["net"] }
+
+[dev-dependencies]
+rist-core = { git = "https://github.com/wavey-ai/rist-rs.git" }
+tokio = { workspace = true, features = ["macros", "net", "rt", "time"] }

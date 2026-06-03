@@ -272,7 +272,46 @@ pub struct EncodedMediaFrame {
     pub sequence: u64,
     pub fragment_count: u16,
     pub decision: FecDecision,
+    pub blocks: Vec<EncodedMediaBlock>,
     pub datagrams: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedMediaBlock {
+    pub block_id: u32,
+    pub fragment_index: u16,
+    pub source_symbols: u16,
+    pub repair_symbols: u32,
+    pub first_datagram_index: usize,
+    pub datagram_count: usize,
+    pub payload_len: usize,
+}
+
+impl EncodedMediaBlock {
+    pub fn source_datagram_indices(&self) -> std::ops::Range<usize> {
+        self.first_datagram_index
+            ..self
+                .first_datagram_index
+                .saturating_add(usize::from(self.source_symbols))
+                .min(
+                    self.first_datagram_index
+                        .saturating_add(self.datagram_count),
+                )
+    }
+
+    pub fn repair_datagram_indices(&self) -> std::ops::Range<usize> {
+        let repair_start = self
+            .first_datagram_index
+            .saturating_add(usize::from(self.source_symbols))
+            .min(
+                self.first_datagram_index
+                    .saturating_add(self.datagram_count),
+            );
+        repair_start
+            ..self
+                .first_datagram_index
+                .saturating_add(self.datagram_count)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -343,6 +382,7 @@ impl MediaFecEncoder {
             });
         }
 
+        let mut blocks = Vec::new();
         let mut datagrams = Vec::new();
         for fragment_index in 0..fragment_count {
             let start = fragment_index * max_fragment_payload;
@@ -374,16 +414,29 @@ impl MediaFecEncoder {
                 .set_source_symbols(initial_decision.config.source_symbols);
             self.fec
                 .set_symbol_size(initial_decision.config.symbol_size);
-            datagrams.extend(
-                self.fec
-                    .encode_block_with_repair_symbols(&block, repair_symbols)?,
-            );
+            let block_id = self.fec.block_id();
+            let first_datagram_index = datagrams.len();
+            let block_datagrams = self
+                .fec
+                .encode_block_with_repair_symbols(&block, repair_symbols)?;
+            let datagram_count = block_datagrams.len();
+            datagrams.extend(block_datagrams);
+            blocks.push(EncodedMediaBlock {
+                block_id,
+                fragment_index: fragment_index as u16,
+                source_symbols: block_source_symbols,
+                repair_symbols,
+                first_datagram_index,
+                datagram_count,
+                payload_len: block.len(),
+            });
         }
 
         Ok(EncodedMediaFrame {
             sequence: frame.metadata.sequence,
             fragment_count: fragment_count as u16,
             decision: initial_decision,
+            blocks,
             datagrams,
         })
     }
@@ -730,6 +783,29 @@ mod tests {
             })
             .expect("encode media");
         assert!(encoded.fragment_count > 1);
+        assert_eq!(encoded.blocks.len(), usize::from(encoded.fragment_count));
+        for (fragment_index, block) in encoded.blocks.iter().enumerate() {
+            assert_eq!(block.fragment_index, fragment_index as u16);
+            assert!(block.source_symbols >= 1);
+            assert!(block.source_symbols <= policy.max_source_symbols);
+            assert!(block.repair_symbols >= 1);
+            assert_eq!(
+                block.source_datagram_indices().count(),
+                usize::from(block.source_symbols)
+            );
+            assert_eq!(
+                block.repair_datagram_indices().count(),
+                block.repair_symbols as usize
+            );
+            assert_eq!(
+                block.datagram_count,
+                usize::from(block.source_symbols) + block.repair_symbols as usize
+            );
+            assert!(
+                block.payload_len
+                    <= policy.max_source_symbols as usize * policy.symbol_size as usize
+            );
+        }
 
         let mut decoder = MediaFecDecoder::new();
         let mut decoded = None;

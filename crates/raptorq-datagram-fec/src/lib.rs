@@ -13,8 +13,8 @@ pub use adaptive::{
     MediaPriority, NetworkMetrics,
 };
 pub use media::{
-    decode_serialized_media_access_unit, DecodedMediaFrame, EncodedMediaFrame, MediaCodec,
-    MediaFecDecoder, MediaFecEncoder, MediaFecError, MediaFragmentHeader, MediaFrame,
+    decode_serialized_media_access_unit, DecodedMediaFrame, EncodedMediaBlock, EncodedMediaFrame,
+    MediaCodec, MediaFecDecoder, MediaFecEncoder, MediaFecError, MediaFragmentHeader, MediaFrame,
     MediaFrameFlags, MediaFrameMetadata, SerializedMediaAccessUnit, MEDIA_FRAME_HEADER_LEN,
 };
 pub use sequence::{SequenceObservation, SequenceStats, SequenceTracker};

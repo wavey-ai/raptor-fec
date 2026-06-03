@@ -32,10 +32,10 @@ impl MediaCodec {
 
     fn priority(self, flags: MediaFrameFlags) -> MediaPriority {
         match self {
-            Self::Opus => MediaPriority::Audio,
+            Self::Opus | Self::Aac => MediaPriority::Audio,
             Self::H264 if flags.is_keyframe() => MediaPriority::VideoKey,
             Self::H264 => MediaPriority::VideoDelta,
-            Self::Unknown | Self::Aac | Self::Data => MediaPriority::Data,
+            Self::Unknown | Self::Data => MediaPriority::Data,
         }
     }
 }

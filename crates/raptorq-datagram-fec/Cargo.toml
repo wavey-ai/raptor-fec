@@ -1,6 +1,6 @@
 [package]
 name = "raptorq-datagram-fec"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 description = "RaptorQ FEC framing for low-latency datagram transports."
 repository.workspace = true

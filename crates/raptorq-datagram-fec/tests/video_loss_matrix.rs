@@ -55,6 +55,34 @@ struct StreamSimulation {
     wire_datagrams: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RandomizedVideoNetwork {
+    name: &'static str,
+    rtt_ms: u32,
+    feedback_interval_ms: u32,
+    playout_latency_ms: u32,
+    loss_fraction: f32,
+    burst_fraction: f32,
+    seed: u64,
+}
+
+#[derive(Debug, Default)]
+struct RandomizedVideoScorecard {
+    frame_count: usize,
+    source_loss_frames: usize,
+    repair_loss_frames: usize,
+    fec_recovered_frames: usize,
+    fec_recovered_source_loss_frames: usize,
+    fec_failed_frames: usize,
+    fec_failed_no_source_loss_frames: usize,
+    rist_ready_frames: usize,
+    srt_best_case_ready_frames: usize,
+    source_datagrams: usize,
+    wire_datagrams: usize,
+    lost_source_datagrams: usize,
+    lost_repair_datagrams: usize,
+}
+
 #[derive(Debug)]
 struct RistFrameRecovery {
     dropped_packets: usize,
@@ -787,6 +815,105 @@ fn raptorq_scorecard_is_as_good_or_better_than_feedback_arq_for_low_latency_vide
 }
 
 #[test]
+fn randomized_video_scorecard_keeps_fec_ahead_of_feedback_arq_under_sub_rtt_playout() {
+    let networks = [
+        RandomizedVideoNetwork {
+            name: "metro-loss",
+            rtt_ms: 35,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
+            loss_fraction: 0.04,
+            burst_fraction: 0.08,
+            seed: 0x7A11_D00D_0001,
+        },
+        RandomizedVideoNetwork {
+            name: "wan-loss",
+            rtt_ms: 70,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
+            loss_fraction: 0.06,
+            burst_fraction: 0.10,
+            seed: 0x7A11_D00D_0002,
+        },
+        RandomizedVideoNetwork {
+            name: "long-wan-loss",
+            rtt_ms: 120,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
+            loss_fraction: 0.08,
+            burst_fraction: 0.12,
+            seed: 0x7A11_D00D_0003,
+        },
+    ];
+
+    for network in networks {
+        assert!(
+            network.rtt_ms > network.playout_latency_ms,
+            "{} must be a sub-RTT playout scenario for the SRT comparison",
+            network.name
+        );
+        let scorecard = run_randomized_video_scorecard(network, 180);
+        let wire_overhead =
+            scorecard.wire_datagrams as f32 / scorecard.source_datagrams.max(1) as f32;
+
+        assert_eq!(scorecard.frame_count, 180);
+        assert!(
+            scorecard.source_loss_frames >= 45,
+            "{} should exercise frequent source-packet loss: {:?}",
+            network.name,
+            scorecard
+        );
+        assert!(
+            scorecard.repair_loss_frames >= 20,
+            "{} should also drop repair datagrams so the test is not source-only: {:?}",
+            network.name,
+            scorecard
+        );
+        assert_eq!(
+            scorecard.fec_failed_no_source_loss_frames, 0,
+            "{} FEC must never lose a frame when every source datagram arrives: {:?}",
+            network.name, scorecard
+        );
+        assert!(
+            scorecard.fec_recovered_frames >= scorecard.srt_best_case_ready_frames,
+            "{} RaptorQ must not deliver fewer in-deadline frames than best-case SRT ARQ: {:?}",
+            network.name,
+            scorecard
+        );
+        assert!(
+            scorecard.fec_recovered_frames >= scorecard.rist_ready_frames,
+            "{} RaptorQ must not deliver fewer in-deadline frames than pure-RIST feedback: {:?}",
+            network.name,
+            scorecard
+        );
+        assert!(
+            scorecard.fec_recovered_source_loss_frames >= scorecard.source_loss_frames * 3 / 4,
+            "{} RaptorQ should recover most frames that feedback ARQ misses under sub-RTT playout: {:?}",
+            network.name,
+            scorecard
+        );
+        assert!(
+            scorecard.fec_recovered_frames > scorecard.srt_best_case_ready_frames,
+            "{} RaptorQ should strictly beat best-case SRT once RTT exceeds the playout budget: {:?}",
+            network.name,
+            scorecard
+        );
+        assert!(
+            scorecard.fec_recovered_frames > scorecard.rist_ready_frames,
+            "{} RaptorQ should strictly beat pure-RIST feedback once RTT exceeds the playout budget: {:?}",
+            network.name,
+            scorecard
+        );
+        assert!(
+            wire_overhead <= 1.32,
+            "{} wire overhead {wire_overhead:.3} exceeded low-latency budget: {:?}",
+            network.name,
+            scorecard
+        );
+    }
+}
+
+#[test]
 fn feedback_only_matches_fec_only_when_playout_latency_covers_feedback_turn_and_rtt() {
     let frames = [
         StreamFrameScenario {
@@ -1114,6 +1241,151 @@ fn run_stream_simulation(
     simulation
 }
 
+fn run_randomized_video_scorecard(
+    network: RandomizedVideoNetwork,
+    frame_count: usize,
+) -> RandomizedVideoScorecard {
+    let mut encoder = MediaFecEncoder::new(video_controller());
+    let mut decoder = MediaFecDecoder::new();
+    let mut scorecard = RandomizedVideoScorecard {
+        frame_count,
+        ..RandomizedVideoScorecard::default()
+    };
+    let mut state = network.seed;
+
+    for frame_index in 0..frame_count {
+        let flags = if frame_index % 30 == 0 {
+            MediaFrameFlags::keyframe()
+        } else {
+            MediaFrameFlags::default()
+        };
+        let payload_len = randomized_scorecard_payload_len(frame_index);
+        let payload = video_payload(payload_len);
+        let metadata = MediaFrameMetadata {
+            duration_ms: 16,
+            flags,
+            ..MediaFrameMetadata::new(
+                77,
+                encoder.allocate_sequence(),
+                (frame_index as u64) * 16,
+                MediaCodec::H264,
+            )
+        };
+        let encoded = encoder
+            .encode_frame(MediaFrame {
+                metadata,
+                payload: &payload,
+            })
+            .expect("encode randomized video access unit");
+        let block_layout = encoded_block_layout(&encoded);
+        let dropped = randomized_wire_loss(&block_layout, &mut state, network);
+        let lost_source = total_lost_source_symbols(&block_layout, &dropped);
+        let lost_repair = total_lost_repair_symbols(&block_layout, &dropped);
+
+        scorecard.source_datagrams += total_source_symbols(&block_layout);
+        scorecard.wire_datagrams += encoded.datagrams.len();
+        scorecard.lost_source_datagrams += lost_source;
+        scorecard.lost_repair_datagrams += lost_repair;
+
+        if lost_source > 0 {
+            scorecard.source_loss_frames += 1;
+        }
+        if lost_repair > 0 {
+            scorecard.repair_loss_frames += 1;
+        }
+        if feedback_only_arq_can_recover_before_deadline(
+            lost_source,
+            network.rtt_ms,
+            network.feedback_interval_ms,
+            network.playout_latency_ms,
+        ) {
+            scorecard.rist_ready_frames += 1;
+        }
+        if feedback_only_arq_can_recover_before_deadline(
+            lost_source,
+            network.rtt_ms,
+            0,
+            network.playout_latency_ms,
+        ) {
+            scorecard.srt_best_case_ready_frames += 1;
+        }
+
+        let mut recovered = false;
+        for (datagram_index, datagram) in encoded.datagrams.iter().enumerate() {
+            if dropped.contains(&datagram_index) {
+                continue;
+            }
+            if let Some(decoded) = decoder.push_datagram(datagram).expect("decode datagram") {
+                assert_eq!(
+                    decoded.payload, payload,
+                    "{} decoded randomized frame payload mismatch at frame {frame_index}",
+                    network.name
+                );
+                recovered = true;
+            }
+        }
+
+        if recovered {
+            scorecard.fec_recovered_frames += 1;
+            if lost_source > 0 {
+                scorecard.fec_recovered_source_loss_frames += 1;
+            }
+        } else {
+            scorecard.fec_failed_frames += 1;
+            if lost_source == 0 {
+                scorecard.fec_failed_no_source_loss_frames += 1;
+            }
+        }
+    }
+
+    scorecard
+}
+
+fn randomized_scorecard_payload_len(frame_index: usize) -> usize {
+    if frame_index % 30 == 0 {
+        if frame_index % 60 == 0 {
+            96_000
+        } else {
+            40_000
+        }
+    } else {
+        match frame_index % 11 {
+            0 => 24_000,
+            3 | 7 => 9_000,
+            _ => 18_000,
+        }
+    }
+}
+
+fn randomized_wire_loss(
+    blocks: &[EncodedMediaBlock],
+    state: &mut u64,
+    network: RandomizedVideoNetwork,
+) -> BTreeSet<usize> {
+    let mut dropped = BTreeSet::new();
+    for block in blocks {
+        let block_start = block.first_datagram_index;
+        let block_end = block.first_datagram_index + block.datagram_count;
+        for datagram_index in block_start..block_end {
+            if random_unit_interval(state) < network.loss_fraction {
+                dropped.insert(datagram_index);
+            }
+        }
+
+        if block.datagram_count > 1 && random_unit_interval(state) < network.burst_fraction {
+            let burst_cap = (block.repair_symbols as usize)
+                .saturating_add(1)
+                .clamp(1, 5)
+                .min(block.datagram_count);
+            let burst_len = 1 + random_usize(state, burst_cap);
+            let max_start = block.datagram_count - burst_len;
+            let start = block_start + random_usize(state, max_start + 1);
+            dropped.extend(start..start + burst_len);
+        }
+    }
+    dropped
+}
+
 fn run_scenario(
     scenario: VideoScenario,
 ) -> (EncodedMediaFrame, DecodedMediaFrame, BTreeSet<usize>) {
@@ -1270,6 +1542,18 @@ fn total_lost_source_symbols(blocks: &[EncodedMediaBlock], dropped: &BTreeSet<us
     blocks
         .iter()
         .map(|block| lost_source_symbols_for_block(block, dropped))
+        .sum()
+}
+
+fn total_lost_repair_symbols(blocks: &[EncodedMediaBlock], dropped: &BTreeSet<usize>) -> usize {
+    blocks
+        .iter()
+        .map(|block| {
+            block
+                .repair_datagram_indices()
+                .filter(|datagram_index| dropped.contains(datagram_index))
+                .count()
+        })
         .sum()
 }
 
@@ -1949,4 +2233,17 @@ fn splitmix64(mut value: u64) -> u64 {
     mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     mixed ^ (mixed >> 31)
+}
+
+fn random_unit_interval(state: &mut u64) -> f32 {
+    *state = splitmix64(*state);
+    ((*state >> 11) as f64 / ((1_u64 << 53) as f64)) as f32
+}
+
+fn random_usize(state: &mut u64, max_exclusive: usize) -> usize {
+    if max_exclusive <= 1 {
+        return 0;
+    }
+    *state = splitmix64(*state);
+    (*state as usize) % max_exclusive
 }

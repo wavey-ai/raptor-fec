@@ -141,12 +141,39 @@ struct RistStreamRecovery {
     retransmission_arrival_ms: u32,
 }
 
+#[derive(Debug, Default)]
+struct RistBroadCoreScorecard {
+    frame_count: usize,
+    recovered_frames: usize,
+    unrecovered_frames: usize,
+    source_loss_frames: usize,
+    feedback_ready_frames: usize,
+    feedback_missed_frames: usize,
+    dropped_packets: usize,
+    unmapped_source_drops: usize,
+    missing_packets_before_feedback: usize,
+    retransmitted_packets: usize,
+    unretransmitted_packets: usize,
+}
+
 #[derive(Debug)]
 struct SrtStyleFrameRecovery {
     dropped_packets: usize,
     retransmitted_packets: usize,
     retransmission_arrival_ms: u32,
     recovered_payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct RistSentPacket {
+    sequence: u32,
+}
+
+#[derive(Debug)]
+struct RistSentFrame {
+    payload: Vec<u8>,
+    packets: Vec<RistSentPacket>,
+    dropped_indices: BTreeSet<usize>,
 }
 
 #[derive(Debug)]
@@ -960,77 +987,10 @@ fn randomized_video_scorecard_keeps_fec_ahead_of_feedback_arq_under_sub_rtt_play
 
 #[test]
 fn broad_low_latency_video_impairment_matrix_keeps_fec_ahead_of_feedback_arq() {
-    let profiles = [
-        BroadVideoImpairmentProfile {
-            name: "studio-lan-jitter",
-            rtt_ms: 12,
-            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
-            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
-            frame_count: 120,
-            max_source_loss_per_block: 1,
-            repair_noise_every: 5,
-            reorder_span: 3,
-            shape: BoundedLossShape::Alternating {
-                seed: 0xB10A_D000_1001,
-            },
-            max_wire_overhead: 1.30,
-        },
-        BroadVideoImpairmentProfile {
-            name: "metro-sub-rtt-periodic",
-            rtt_ms: 45,
-            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
-            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
-            frame_count: 180,
-            max_source_loss_per_block: 1,
-            repair_noise_every: 4,
-            reorder_span: 4,
-            shape: BoundedLossShape::Periodic { every: 3, phase: 1 },
-            max_wire_overhead: 1.32,
-        },
-        BroadVideoImpairmentProfile {
-            name: "wan-front-burst",
-            rtt_ms: 70,
-            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
-            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
-            frame_count: 180,
-            max_source_loss_per_block: 2,
-            repair_noise_every: 3,
-            reorder_span: 6,
-            shape: BoundedLossShape::Front,
-            max_wire_overhead: 1.34,
-        },
-        BroadVideoImpairmentProfile {
-            name: "cellular-late-burst",
-            rtt_ms: 95,
-            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
-            playout_latency_ms: 45,
-            frame_count: 180,
-            max_source_loss_per_block: 2,
-            repair_noise_every: 3,
-            reorder_span: 7,
-            shape: BoundedLossShape::Late,
-            max_wire_overhead: 1.34,
-        },
-        BroadVideoImpairmentProfile {
-            name: "long-wan-random-bursty",
-            rtt_ms: 140,
-            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
-            playout_latency_ms: 60,
-            frame_count: 180,
-            max_source_loss_per_block: 2,
-            repair_noise_every: 2,
-            reorder_span: 8,
-            shape: BoundedLossShape::Random {
-                seed: 0xB10A_D000_5005,
-            },
-            max_wire_overhead: 1.34,
-        },
-    ];
-
     let mut strict_rist_wins = 0usize;
     let mut strict_srt_wins = 0usize;
 
-    for profile in profiles {
+    for profile in broad_video_impairment_profiles() {
         let scorecard = run_broad_video_impairment_scorecard(profile);
         let wire_overhead =
             scorecard.wire_datagrams as f32 / scorecard.source_datagrams.max(1) as f32;
@@ -1108,6 +1068,100 @@ fn broad_low_latency_video_impairment_matrix_keeps_fec_ahead_of_feedback_arq() {
     assert!(
         strict_rist_wins >= 4,
         "the broad matrix should show strict FEC wins over pure RIST in every sub-feedback profile"
+    );
+}
+
+#[test]
+fn pure_rist_core_broad_video_matrix_misses_deadlines_that_fec_recovers() {
+    let mut strict_rist_wins = 0usize;
+
+    for profile in broad_video_impairment_profiles() {
+        let fec = run_broad_video_impairment_scorecard(profile);
+        let rist = run_pure_rist_core_broad_video_scorecard(profile);
+        let sub_feedback_deadline = profile.rtt_ms.saturating_add(profile.feedback_interval_ms)
+            > profile.playout_latency_ms;
+
+        assert_eq!(fec.fec_failed_frames, 0);
+        assert_eq!(rist.frame_count, profile.frame_count);
+        assert_eq!(
+            rist.unrecovered_frames, 0,
+            "{} pure-RIST core should eventually reconstruct every video frame in a continuous stream: {:?}",
+            profile.name, rist
+        );
+        assert_eq!(rist.recovered_frames, rist.frame_count);
+        assert!(
+            rist.source_loss_frames <= fec.source_loss_frames,
+            "{} pure-RIST should not exercise more source-loss frames than the FEC profile: FEC={:?} RIST={:?}",
+            profile.name,
+            fec,
+            rist
+        );
+        assert!(
+            rist.dropped_packets <= fec.lost_source_datagrams,
+            "{} pure-RIST should not drop more source packets than the FEC profile: FEC={:?} RIST={:?}",
+            profile.name,
+            fec,
+            rist
+        );
+        assert_eq!(
+            rist.dropped_packets + rist.unmapped_source_drops,
+            fec.lost_source_datagrams
+        );
+        assert_eq!(
+            rist.missing_packets_before_feedback, rist.dropped_packets,
+            "{} pure-RIST should detect every dropped source packet in the continuous stream",
+            profile.name
+        );
+        assert_eq!(
+            rist.retransmitted_packets, rist.dropped_packets,
+            "{} pure-RIST retransmission count should match the dropped source packets",
+            profile.name
+        );
+        assert_eq!(
+            rist.unretransmitted_packets, 0,
+            "{} pure-RIST should not leave dropped source packets unretransmitted",
+            profile.name
+        );
+        assert!(
+            rist.source_loss_frames >= profile.frame_count * 3 / 4,
+            "{} should exercise source loss on most frames: {:?}",
+            profile.name,
+            rist
+        );
+        assert!(
+            fec.fec_recovered_frames >= rist.feedback_ready_frames,
+            "{} FEC must not deliver fewer in-deadline frames than actual pure-RIST core feedback: FEC={:?} RIST={:?}",
+            profile.name,
+            fec,
+            rist
+        );
+
+        if sub_feedback_deadline {
+            assert_eq!(
+                rist.feedback_missed_frames, rist.source_loss_frames,
+                "{} every lossy pure-RIST frame should miss this low-latency playout budget",
+                profile.name
+            );
+            assert!(
+                fec.fec_recovered_frames > rist.feedback_ready_frames,
+                "{} FEC should strictly beat actual pure-RIST core under sub-feedback-turn playout: FEC={:?} RIST={:?}",
+                profile.name,
+                fec,
+                rist
+            );
+            strict_rist_wins += 1;
+        } else {
+            assert_eq!(
+                rist.feedback_missed_frames, 0,
+                "{} low-RTT pure-RIST profile should meet this playout budget",
+                profile.name
+            );
+        }
+    }
+
+    assert!(
+        strict_rist_wins >= 4,
+        "the actual pure-RIST core broad matrix should show strict FEC wins in every sub-feedback profile"
     );
 }
 
@@ -1190,6 +1244,75 @@ fn video_delta_frames_fail_closed_when_loss_exceeds_parity_budget() {
     );
 }
 
+fn broad_video_impairment_profiles() -> [BroadVideoImpairmentProfile; 5] {
+    [
+        BroadVideoImpairmentProfile {
+            name: "studio-lan-jitter",
+            rtt_ms: 12,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
+            frame_count: 120,
+            max_source_loss_per_block: 1,
+            repair_noise_every: 5,
+            reorder_span: 3,
+            shape: BoundedLossShape::Alternating {
+                seed: 0xB10A_D000_1001,
+            },
+            max_wire_overhead: 1.30,
+        },
+        BroadVideoImpairmentProfile {
+            name: "metro-sub-rtt-periodic",
+            rtt_ms: 45,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
+            frame_count: 180,
+            max_source_loss_per_block: 1,
+            repair_noise_every: 4,
+            reorder_span: 4,
+            shape: BoundedLossShape::Periodic { every: 3, phase: 1 },
+            max_wire_overhead: 1.32,
+        },
+        BroadVideoImpairmentProfile {
+            name: "wan-front-burst",
+            rtt_ms: 70,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
+            frame_count: 180,
+            max_source_loss_per_block: 2,
+            repair_noise_every: 3,
+            reorder_span: 6,
+            shape: BoundedLossShape::Front,
+            max_wire_overhead: 1.34,
+        },
+        BroadVideoImpairmentProfile {
+            name: "cellular-late-burst",
+            rtt_ms: 95,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: 45,
+            frame_count: 180,
+            max_source_loss_per_block: 2,
+            repair_noise_every: 3,
+            reorder_span: 7,
+            shape: BoundedLossShape::Late,
+            max_wire_overhead: 1.34,
+        },
+        BroadVideoImpairmentProfile {
+            name: "long-wan-random-bursty",
+            rtt_ms: 140,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: 60,
+            frame_count: 180,
+            max_source_loss_per_block: 2,
+            repair_noise_every: 2,
+            reorder_span: 8,
+            shape: BoundedLossShape::Random {
+                seed: 0xB10A_D000_5005,
+            },
+            max_wire_overhead: 1.34,
+        },
+    ]
+}
+
 fn feedback_only_arq_can_recover_before_deadline(
     lost_packets: usize,
     rtt_ms: u32,
@@ -1215,10 +1338,12 @@ fn run_pure_rist_frame_recovery(
     let mut sender = SimpleSenderCore::new(0x1122_3344, 1024).with_rtcp_intervals(intervals);
     let mut receiver = SimpleReceiverCore::new(0x5566_7788, "raptor-fec-video", NackMode::Range)
         .with_rtcp_intervals(intervals);
-    let packets = payload
+    let mut packets = payload
         .chunks(usize::from(DEFAULT_SYMBOL_SIZE))
         .map(|chunk| sender.send_payload(chunk, ntp, start))
         .collect::<Vec<_>>();
+    let payload_packet_count = packets.len();
+    packets.push(sender.send_payload(b"tail-probe", ntp, start));
     let mut received = BTreeMap::new();
 
     for (index, packet) in packets.iter().enumerate() {
@@ -1270,7 +1395,7 @@ fn run_pure_rist_frame_recovery(
     );
 
     let mut recovered_payload = Vec::with_capacity(payload.len());
-    for packet in &packets {
+    for packet in packets.iter().take(payload_packet_count) {
         recovered_payload.extend_from_slice(
             received
                 .get(&packet.sequence)
@@ -1643,6 +1768,191 @@ fn run_broad_video_impairment_scorecard(
     }
 
     scorecard
+}
+
+fn run_pure_rist_core_broad_video_scorecard(
+    profile: BroadVideoImpairmentProfile,
+) -> RistBroadCoreScorecard {
+    let mut encoder = MediaFecEncoder::new(video_controller());
+    let mut scorecard = RistBroadCoreScorecard {
+        frame_count: profile.frame_count,
+        ..RistBroadCoreScorecard::default()
+    };
+    let start = Instant::now();
+    let ntp = ntp_from_unix_duration(Duration::from_secs(1));
+    let intervals = RtcpIntervals {
+        feedback: Duration::from_millis(u64::from(profile.feedback_interval_ms)),
+        report: Duration::from_secs(1),
+        echo: Duration::from_secs(1),
+    };
+    let mut sender = SimpleSenderCore::new(0x1122_3344, 65_536).with_rtcp_intervals(intervals);
+    let mut receiver = SimpleReceiverCore::new(0x5566_7788, "raptor-fec-video", NackMode::Range)
+        .with_rtcp_intervals(intervals);
+    let mut received = BTreeMap::new();
+    let mut sent_frames = Vec::with_capacity(profile.frame_count);
+
+    let pre_roll = sender.send_payload(b"stream-preroll", ntp, start);
+    let observed = receiver
+        .accept_packet(&pre_roll.bytes)
+        .expect("pure RIST receiver accepts pre-roll packet");
+    received.insert(observed.sequence, observed.payload);
+
+    for frame_index in 0..profile.frame_count {
+        let flags = if frame_index % 30 == 0 {
+            MediaFrameFlags::keyframe()
+        } else {
+            MediaFrameFlags::default()
+        };
+        let payload = video_payload(randomized_scorecard_payload_len(frame_index));
+        let metadata = MediaFrameMetadata {
+            duration_ms: 16,
+            flags,
+            ..MediaFrameMetadata::new(
+                202,
+                encoder.allocate_sequence(),
+                (frame_index as u64) * 16,
+                MediaCodec::H264,
+            )
+        };
+        let encoded = encoder
+            .encode_frame(MediaFrame {
+                metadata,
+                payload: &payload,
+            })
+            .expect("encode broad pure-RIST comparison frame");
+        let dropped = bounded_broad_video_drops(&encoded.blocks, frame_index, profile);
+        let fec_source_drops = dropped_source_chunk_indices(&encoded.blocks, &dropped);
+        let lost_source = total_lost_source_symbols(&encoded.blocks, &dropped);
+        assert_eq!(
+            fec_source_drops.len(),
+            lost_source,
+            "{} pure-RIST source-drop mapping mismatch at frame {frame_index}",
+            profile.name
+        );
+        let chunks = payload
+            .chunks(usize::from(DEFAULT_SYMBOL_SIZE))
+            .map(Vec::from)
+            .collect::<Vec<_>>();
+        let source_drops = fec_source_drops
+            .iter()
+            .copied()
+            .filter(|index| *index < chunks.len())
+            .collect::<BTreeSet<_>>();
+        scorecard.dropped_packets += source_drops.len();
+        scorecard.unmapped_source_drops += fec_source_drops.len() - source_drops.len();
+
+        let mut packets = Vec::new();
+        for (chunk_index, chunk) in chunks.iter().enumerate() {
+            let packet = sender.send_payload(chunk, ntp, start);
+            if !source_drops.contains(&chunk_index) {
+                let observed = receiver
+                    .accept_packet(&packet.bytes)
+                    .expect("pure RIST receiver accepts stream packet");
+                received.insert(observed.sequence, observed.payload);
+            }
+            packets.push(RistSentPacket {
+                sequence: packet.sequence,
+            });
+        }
+
+        sent_frames.push(RistSentFrame {
+            payload,
+            packets,
+            dropped_indices: source_drops,
+        });
+    }
+
+    let tail = sender.send_payload(b"stream-tail", ntp, start);
+    let observed = receiver
+        .accept_packet(&tail.bytes)
+        .expect("pure RIST receiver accepts tail packet");
+    received.insert(observed.sequence, observed.payload);
+
+    scorecard.missing_packets_before_feedback = receiver.missing_sequences().len();
+    let _ = receiver.poll_rtcp(start, ntp);
+    let retries = receiver
+        .poll_rtcp(
+            start + Duration::from_millis(u64::from(profile.feedback_interval_ms)),
+            ntp,
+        )
+        .and_then(|feedback| sender.handle_feedback_at(&feedback, ntp).ok())
+        .unwrap_or_default();
+    let retransmitted_sequences = retries
+        .iter()
+        .map(|packet| packet.sequence)
+        .collect::<BTreeSet<_>>();
+    scorecard.retransmitted_packets = retransmitted_sequences.len();
+
+    for retry in &retries {
+        let observed = receiver
+            .accept_packet(&retry.bytes)
+            .expect("pure RIST receiver accepts stream retransmission");
+        assert!(observed.recovered);
+        received.insert(observed.sequence, observed.payload);
+    }
+
+    let retransmission_arrival_ms = profile.feedback_interval_ms.saturating_add(profile.rtt_ms);
+    for frame in sent_frames {
+        let source_loss = !frame.dropped_indices.is_empty();
+        if source_loss {
+            scorecard.source_loss_frames += 1;
+            let retransmitted_for_frame = frame
+                .dropped_indices
+                .iter()
+                .filter_map(|index| frame.packets.get(*index))
+                .filter(|packet| retransmitted_sequences.contains(&packet.sequence))
+                .count();
+            scorecard.unretransmitted_packets += frame
+                .dropped_indices
+                .len()
+                .saturating_sub(retransmitted_for_frame);
+        }
+
+        let mut recovered_payload = Vec::with_capacity(frame.payload.len());
+        let mut complete = true;
+        for packet in &frame.packets {
+            if let Some(payload) = received.get(&packet.sequence) {
+                recovered_payload.extend_from_slice(payload);
+            } else {
+                complete = false;
+                break;
+            }
+        }
+
+        let recovered = complete && recovered_payload == frame.payload;
+        if recovered {
+            scorecard.recovered_frames += 1;
+        } else {
+            scorecard.unrecovered_frames += 1;
+        }
+
+        if !source_loss || (recovered && retransmission_arrival_ms <= profile.playout_latency_ms) {
+            scorecard.feedback_ready_frames += 1;
+        } else {
+            scorecard.feedback_missed_frames += 1;
+        }
+    }
+
+    scorecard
+}
+
+fn dropped_source_chunk_indices(
+    blocks: &[EncodedMediaBlock],
+    dropped: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
+    let mut source_chunk_index = 0usize;
+    let mut source_drops = BTreeSet::new();
+
+    for block in blocks {
+        for datagram_index in block.source_datagram_indices() {
+            if dropped.contains(&datagram_index) {
+                source_drops.insert(source_chunk_index);
+            }
+            source_chunk_index += 1;
+        }
+    }
+
+    source_drops
 }
 
 fn bounded_broad_video_drops(

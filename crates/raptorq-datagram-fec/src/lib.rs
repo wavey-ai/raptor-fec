@@ -234,7 +234,7 @@ impl DatagramFecHeader {
     }
 
     fn oti(&self) -> ObjectTransmissionInformation {
-        ObjectTransmissionInformation::with_defaults(self.transfer_length as u64, self.symbol_size)
+        exact_one_block_oti(self.transfer_length as u64, self.symbol_size)
     }
 
     fn encode_prefix(&self, bytes: &mut [u8]) -> Result<(), DatagramFecError> {
@@ -557,7 +557,10 @@ impl DatagramFecEncoder {
         data: &[u8],
         repair_symbols: u32,
     ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
-        let encoder = Encoder::with_defaults(data, self.config.symbol_size);
+        let encoder = Encoder::new(
+            data,
+            exact_one_block_oti(data.len() as u64, self.config.symbol_size),
+        );
         let raptor_config = encoder.get_config();
         let packets = encoder.get_encoded_packets(repair_symbols);
         let block_id = self.block_id;
@@ -787,6 +790,10 @@ pub fn decode_header(datagram: &[u8]) -> Result<DatagramFecHeader, DatagramFecEr
     DatagramFecHeader::decode(datagram)
 }
 
+fn exact_one_block_oti(transfer_length: u64, symbol_size: u16) -> ObjectTransmissionInformation {
+    ObjectTransmissionInformation::new(transfer_length, symbol_size.max(1), 1, 1, 1)
+}
+
 pub fn source_symbol_count(byte_len: usize, symbol_size: u16) -> u16 {
     if byte_len == 0 {
         return 1;
@@ -860,6 +867,59 @@ mod tests {
                 .expect("packet crc"),
             header.packet_crc32
         );
+    }
+
+    #[test]
+    fn configured_symbol_size_is_not_rounded_by_raptorq_defaults() {
+        let payload = vec![0x31; DatagramFecConfig::default().max_payload_len()];
+        let repair_symbols = 2;
+        let mut encoder = DatagramFecEncoder::new().with_repair_symbols(repair_symbols);
+        let datagrams = encoder.encode_block(&payload).expect("encode block");
+
+        assert_eq!(
+            datagrams.len(),
+            usize::from(DEFAULT_SOURCE_SYMBOLS) + repair_symbols as usize
+        );
+
+        for datagram in datagrams {
+            let header = decode_header(&datagram).expect("header");
+            assert_eq!(header.symbol_size, DEFAULT_SYMBOL_SIZE);
+            assert_eq!(header.source_symbols, DEFAULT_SOURCE_SYMBOLS);
+            assert_eq!(
+                header.payload_len as usize,
+                ENCODING_PACKET_HEADER_LEN + usize::from(DEFAULT_SYMBOL_SIZE)
+            );
+            assert_eq!(
+                datagram.len(),
+                datagram_size_for_symbol_size(DEFAULT_SYMBOL_SIZE)
+            );
+        }
+    }
+
+    #[test]
+    fn default_periodic_loss_recovers_many_full_blocks() {
+        let block_len = DatagramFecConfig::default().max_payload_len();
+        let payload = (0..(block_len * 96))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut encoder = DatagramFecEncoder::new().with_repair_symbols(2);
+        let datagrams = encoder.encode_payload(&payload).expect("encode payload");
+        let mut decoder = DatagramFecDecoder::new();
+        let mut recovered = Vec::with_capacity(payload.len());
+        let mut dropped = 0usize;
+
+        for (index, datagram) in datagrams.iter().enumerate() {
+            if (index + 1) % 5 == 0 {
+                dropped += 1;
+                continue;
+            }
+            if let Some(decoded) = decoder.push_datagram(datagram).expect("decode datagram") {
+                recovered.extend_from_slice(&decoded);
+            }
+        }
+
+        assert!(dropped > 0);
+        assert_eq!(recovered, payload);
     }
 
     #[test]

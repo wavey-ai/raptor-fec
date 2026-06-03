@@ -864,8 +864,14 @@ fn randomized_video_scorecard_keeps_fec_ahead_of_feedback_arq_under_sub_rtt_play
             scorecard
         );
         assert!(
-            scorecard.repair_loss_frames >= 20,
+            scorecard.repair_loss_frames >= scorecard.frame_count / 10,
             "{} should also drop repair datagrams so the test is not source-only: {:?}",
+            network.name,
+            scorecard
+        );
+        assert!(
+            scorecard.lost_repair_datagrams >= scorecard.frame_count / 10,
+            "{} should exercise actual repair-symbol loss, not only repair-loss bookkeeping: {:?}",
             network.name,
             scorecard
         );

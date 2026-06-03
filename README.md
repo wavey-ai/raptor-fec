@@ -127,6 +127,14 @@ feedback/retransmission turn and packet loss stays within the repair budget,
 forward RaptorQ repair can recover frames that feedback-only retransmission
 cannot deliver in time.
 
+Do not read that as "RaptorQ is always more reliable than RIST." RaptorQ-FEC is
+better for bounded-loss, low-latency media because recovery latency is fixed by
+block fill time. RIST/SRT are better for eventual delivery once loss exceeds the
+FEC repair budget, because ARQ can retransmit from sender history if the
+application has enough latency buffer. Production mesh reliability should pair
+this FEC hot path with explicit missing-block repair/backfill instead of
+expecting forward repair alone to cover every WAN loss profile.
+
 ```sh
 (cd ../rist-rs && cargo test -p rist-core feedback)
 (cd ../av-rs && cargo test -p srt --lib)

@@ -83,6 +83,45 @@ struct RandomizedVideoScorecard {
     lost_repair_datagrams: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum BoundedLossShape {
+    Front,
+    Late,
+    Periodic { every: usize, phase: usize },
+    Random { seed: u64 },
+    Alternating { seed: u64 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BroadVideoImpairmentProfile {
+    name: &'static str,
+    rtt_ms: u32,
+    feedback_interval_ms: u32,
+    playout_latency_ms: u32,
+    frame_count: usize,
+    max_source_loss_per_block: usize,
+    repair_noise_every: usize,
+    reorder_span: usize,
+    shape: BoundedLossShape,
+    max_wire_overhead: f32,
+}
+
+#[derive(Debug, Default)]
+struct BroadVideoScorecard {
+    frame_count: usize,
+    source_loss_frames: usize,
+    repair_loss_frames: usize,
+    fec_recovered_frames: usize,
+    fec_failed_frames: usize,
+    rist_ready_frames: usize,
+    srt_best_case_ready_frames: usize,
+    source_datagrams: usize,
+    wire_datagrams: usize,
+    lost_source_datagrams: usize,
+    lost_repair_datagrams: usize,
+    reordered_frames: usize,
+}
+
 #[derive(Debug)]
 struct RistFrameRecovery {
     dropped_packets: usize,
@@ -920,6 +959,159 @@ fn randomized_video_scorecard_keeps_fec_ahead_of_feedback_arq_under_sub_rtt_play
 }
 
 #[test]
+fn broad_low_latency_video_impairment_matrix_keeps_fec_ahead_of_feedback_arq() {
+    let profiles = [
+        BroadVideoImpairmentProfile {
+            name: "studio-lan-jitter",
+            rtt_ms: 12,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
+            frame_count: 120,
+            max_source_loss_per_block: 1,
+            repair_noise_every: 5,
+            reorder_span: 3,
+            shape: BoundedLossShape::Alternating {
+                seed: 0xB10A_D000_1001,
+            },
+            max_wire_overhead: 1.30,
+        },
+        BroadVideoImpairmentProfile {
+            name: "metro-sub-rtt-periodic",
+            rtt_ms: 45,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
+            frame_count: 180,
+            max_source_loss_per_block: 1,
+            repair_noise_every: 4,
+            reorder_span: 4,
+            shape: BoundedLossShape::Periodic { every: 3, phase: 1 },
+            max_wire_overhead: 1.32,
+        },
+        BroadVideoImpairmentProfile {
+            name: "wan-front-burst",
+            rtt_ms: 70,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: LOW_LATENCY_PLAYOUT_MS,
+            frame_count: 180,
+            max_source_loss_per_block: 2,
+            repair_noise_every: 3,
+            reorder_span: 6,
+            shape: BoundedLossShape::Front,
+            max_wire_overhead: 1.34,
+        },
+        BroadVideoImpairmentProfile {
+            name: "cellular-late-burst",
+            rtt_ms: 95,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: 45,
+            frame_count: 180,
+            max_source_loss_per_block: 2,
+            repair_noise_every: 3,
+            reorder_span: 7,
+            shape: BoundedLossShape::Late,
+            max_wire_overhead: 1.34,
+        },
+        BroadVideoImpairmentProfile {
+            name: "long-wan-random-bursty",
+            rtt_ms: 140,
+            feedback_interval_ms: RIST_DEFAULT_FEEDBACK_INTERVAL_MS,
+            playout_latency_ms: 60,
+            frame_count: 180,
+            max_source_loss_per_block: 2,
+            repair_noise_every: 2,
+            reorder_span: 8,
+            shape: BoundedLossShape::Random {
+                seed: 0xB10A_D000_5005,
+            },
+            max_wire_overhead: 1.34,
+        },
+    ];
+
+    let mut strict_rist_wins = 0usize;
+    let mut strict_srt_wins = 0usize;
+
+    for profile in profiles {
+        let scorecard = run_broad_video_impairment_scorecard(profile);
+        let wire_overhead =
+            scorecard.wire_datagrams as f32 / scorecard.source_datagrams.max(1) as f32;
+        let sub_rist_deadline = profile.rtt_ms.saturating_add(profile.feedback_interval_ms)
+            > profile.playout_latency_ms;
+        let sub_srt_deadline = profile.rtt_ms > profile.playout_latency_ms;
+
+        assert_eq!(scorecard.frame_count, profile.frame_count);
+        assert_eq!(
+            scorecard.fec_failed_frames, 0,
+            "{} FEC should recover every bounded-loss reordered frame: {:?}",
+            profile.name, scorecard
+        );
+        assert!(
+            scorecard.source_loss_frames >= profile.frame_count * 3 / 4,
+            "{} should exercise source loss on most video frames: {:?}",
+            profile.name,
+            scorecard
+        );
+        assert!(
+            scorecard.repair_loss_frames >= profile.frame_count / 5,
+            "{} should also exercise repair-symbol loss: {:?}",
+            profile.name,
+            scorecard
+        );
+        assert!(
+            scorecard.reordered_frames >= profile.frame_count / 2,
+            "{} should exercise packet reordering, not only loss: {:?}",
+            profile.name,
+            scorecard
+        );
+        assert!(
+            scorecard.fec_recovered_frames >= scorecard.srt_best_case_ready_frames,
+            "{} FEC must not deliver fewer in-deadline frames than best-case SRT ARQ: {:?}",
+            profile.name,
+            scorecard
+        );
+        assert!(
+            scorecard.fec_recovered_frames >= scorecard.rist_ready_frames,
+            "{} FEC must not deliver fewer in-deadline frames than pure RIST feedback: {:?}",
+            profile.name,
+            scorecard
+        );
+        if sub_srt_deadline {
+            assert!(
+                scorecard.fec_recovered_frames > scorecard.srt_best_case_ready_frames,
+                "{} FEC should strictly beat best-case SRT under sub-RTT playout: {:?}",
+                profile.name,
+                scorecard
+            );
+            strict_srt_wins += 1;
+        }
+        if sub_rist_deadline {
+            assert!(
+                scorecard.fec_recovered_frames > scorecard.rist_ready_frames,
+                "{} FEC should strictly beat pure RIST under sub-feedback-turn playout: {:?}",
+                profile.name,
+                scorecard
+            );
+            strict_rist_wins += 1;
+        }
+        assert!(
+            wire_overhead <= profile.max_wire_overhead,
+            "{} wire overhead {wire_overhead:.3} exceeded {}: {:?}",
+            profile.name,
+            profile.max_wire_overhead,
+            scorecard
+        );
+    }
+
+    assert!(
+        strict_srt_wins >= 4,
+        "the broad matrix should show strict FEC wins over best-case SRT in every sub-RTT profile"
+    );
+    assert!(
+        strict_rist_wins >= 4,
+        "the broad matrix should show strict FEC wins over pure RIST in every sub-feedback profile"
+    );
+}
+
+#[test]
 fn feedback_only_matches_fec_only_when_playout_latency_covers_feedback_turn_and_rtt() {
     let frames = [
         StreamFrameScenario {
@@ -1345,6 +1537,255 @@ fn run_randomized_video_scorecard(
     }
 
     scorecard
+}
+
+fn run_broad_video_impairment_scorecard(
+    profile: BroadVideoImpairmentProfile,
+) -> BroadVideoScorecard {
+    let mut encoder = MediaFecEncoder::new(video_controller());
+    let mut decoder = MediaFecDecoder::new();
+    let mut scorecard = BroadVideoScorecard {
+        frame_count: profile.frame_count,
+        ..BroadVideoScorecard::default()
+    };
+
+    for frame_index in 0..profile.frame_count {
+        let flags = if frame_index % 30 == 0 {
+            MediaFrameFlags::keyframe()
+        } else {
+            MediaFrameFlags::default()
+        };
+        let payload_len = randomized_scorecard_payload_len(frame_index);
+        let payload = video_payload(payload_len);
+        let metadata = MediaFrameMetadata {
+            duration_ms: 16,
+            flags,
+            ..MediaFrameMetadata::new(
+                101,
+                encoder.allocate_sequence(),
+                (frame_index as u64) * 16,
+                MediaCodec::H264,
+            )
+        };
+        let encoded = encoder
+            .encode_frame(MediaFrame {
+                metadata,
+                payload: &payload,
+            })
+            .expect("encode broad video access unit");
+        let block_layout = encoded_block_layout(&encoded);
+        let dropped = bounded_broad_video_drops(&block_layout, frame_index, profile);
+        assert_broad_loss_within_available_repair(profile.name, &block_layout, &dropped);
+
+        let lost_source = total_lost_source_symbols(&block_layout, &dropped);
+        let lost_repair = total_lost_repair_symbols(&block_layout, &dropped);
+        scorecard.source_datagrams += total_source_symbols(&block_layout);
+        scorecard.wire_datagrams += encoded.datagrams.len();
+        scorecard.lost_source_datagrams += lost_source;
+        scorecard.lost_repair_datagrams += lost_repair;
+
+        if lost_source > 0 {
+            scorecard.source_loss_frames += 1;
+        }
+        if lost_repair > 0 {
+            scorecard.repair_loss_frames += 1;
+        }
+        if feedback_only_arq_can_recover_before_deadline(
+            lost_source,
+            profile.rtt_ms,
+            profile.feedback_interval_ms,
+            profile.playout_latency_ms,
+        ) {
+            scorecard.rist_ready_frames += 1;
+        }
+        if feedback_only_arq_can_recover_before_deadline(
+            lost_source,
+            profile.rtt_ms,
+            0,
+            profile.playout_latency_ms,
+        ) {
+            scorecard.srt_best_case_ready_frames += 1;
+        }
+
+        let delivery_order =
+            reordered_delivery_order(encoded.datagrams.len(), profile.reorder_span);
+        if delivery_order
+            .iter()
+            .enumerate()
+            .any(|(position, datagram_index)| position != *datagram_index)
+        {
+            scorecard.reordered_frames += 1;
+        }
+
+        let mut recovered = false;
+        for datagram_index in delivery_order {
+            if dropped.contains(&datagram_index) {
+                continue;
+            }
+            if let Some(decoded) = decoder
+                .push_datagram(&encoded.datagrams[datagram_index])
+                .expect("decode broad video datagram")
+            {
+                assert_eq!(
+                    decoded.payload, payload,
+                    "{} decoded broad video payload mismatch at frame {frame_index}",
+                    profile.name
+                );
+                recovered = true;
+            }
+        }
+
+        if recovered {
+            scorecard.fec_recovered_frames += 1;
+        } else {
+            scorecard.fec_failed_frames += 1;
+        }
+    }
+
+    scorecard
+}
+
+fn bounded_broad_video_drops(
+    blocks: &[EncodedMediaBlock],
+    frame_index: usize,
+    profile: BroadVideoImpairmentProfile,
+) -> BTreeSet<usize> {
+    let mut dropped = BTreeSet::new();
+    let mut random_state = broad_loss_seed(profile.shape, frame_index);
+
+    for block in blocks {
+        let repair_budget = block.repair_symbols as usize;
+        if repair_budget == 0 {
+            continue;
+        }
+
+        let repair_loss = if profile.repair_noise_every > 0
+            && repair_budget >= 2
+            && (frame_index + block.fragment_index as usize) % profile.repair_noise_every == 0
+        {
+            1
+        } else {
+            0
+        };
+        let source_loss_budget = repair_budget
+            .saturating_sub(repair_loss)
+            .min(profile.max_source_loss_per_block);
+
+        dropped.extend(select_bounded_source_losses(
+            block,
+            source_loss_budget,
+            profile.shape,
+            &mut random_state,
+            frame_index,
+        ));
+        dropped.extend(block.repair_datagram_indices().take(repair_loss));
+    }
+
+    dropped
+}
+
+fn broad_loss_seed(shape: BoundedLossShape, frame_index: usize) -> u64 {
+    match shape {
+        BoundedLossShape::Random { seed } | BoundedLossShape::Alternating { seed } => {
+            seed ^ (frame_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        }
+        _ => 0xB10A_D000_0000 ^ frame_index as u64,
+    }
+}
+
+fn select_bounded_source_losses(
+    block: &EncodedMediaBlock,
+    count: usize,
+    shape: BoundedLossShape,
+    random_state: &mut u64,
+    frame_index: usize,
+) -> BTreeSet<usize> {
+    let source_indices = block.source_datagram_indices().collect::<Vec<_>>();
+    if source_indices.is_empty() || count == 0 {
+        return BTreeSet::new();
+    }
+    let count = count.min(source_indices.len());
+
+    match shape {
+        BoundedLossShape::Front => source_indices.into_iter().take(count).collect(),
+        BoundedLossShape::Late => source_indices.into_iter().rev().take(count).collect(),
+        BoundedLossShape::Periodic { every, phase } => {
+            let every = every.max(1);
+            let mut selected = source_indices
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(index, _)| index % every == phase % every)
+                .map(|(_, datagram_index)| datagram_index)
+                .take(count)
+                .collect::<BTreeSet<_>>();
+            if selected.len() < count {
+                selected.extend(source_indices.into_iter().take(count - selected.len()));
+            }
+            selected
+        }
+        BoundedLossShape::Random { .. } => {
+            random_source_losses(&source_indices, count, random_state)
+        }
+        BoundedLossShape::Alternating { .. } => {
+            if frame_index % 3 == 0 {
+                source_indices.into_iter().take(count).collect()
+            } else if frame_index % 3 == 1 {
+                source_indices.into_iter().rev().take(count).collect()
+            } else {
+                random_source_losses(&source_indices, count, random_state)
+            }
+        }
+    }
+}
+
+fn random_source_losses(
+    source_indices: &[usize],
+    count: usize,
+    random_state: &mut u64,
+) -> BTreeSet<usize> {
+    let mut selected = BTreeSet::new();
+    while selected.len() < count {
+        *random_state = splitmix64(*random_state);
+        let index = (*random_state as usize) % source_indices.len();
+        selected.insert(source_indices[index]);
+    }
+    selected
+}
+
+fn reordered_delivery_order(datagram_count: usize, reorder_span: usize) -> Vec<usize> {
+    if reorder_span <= 1 {
+        return (0..datagram_count).collect();
+    }
+    let mut order = Vec::with_capacity(datagram_count);
+    let span = reorder_span.max(2);
+    for chunk_start in (0..datagram_count).step_by(span) {
+        let chunk_end = (chunk_start + span).min(datagram_count);
+        let mut chunk = (chunk_start..chunk_end).collect::<Vec<_>>();
+        chunk.rotate_left(1);
+        order.extend(chunk);
+    }
+    order
+}
+
+fn assert_broad_loss_within_available_repair(
+    name: &str,
+    blocks: &[EncodedMediaBlock],
+    dropped: &BTreeSet<usize>,
+) {
+    for block in blocks {
+        let lost_source = lost_source_symbols_for_block(block, dropped);
+        let lost_repair = block
+            .repair_datagram_indices()
+            .filter(|datagram_index| dropped.contains(datagram_index))
+            .count();
+        assert!(
+            lost_source + lost_repair <= block.repair_symbols as usize,
+            "{name} broad profile lost {lost_source} source and {lost_repair} repair symbols in block {} with only {} repair symbols; dropped={dropped:?}",
+            block.block_id,
+            block.repair_symbols
+        );
+    }
 }
 
 fn randomized_scorecard_payload_len(frame_index: usize) -> usize {

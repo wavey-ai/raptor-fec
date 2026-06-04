@@ -42,6 +42,54 @@ RaptorQ datagram layer itself treats that as ordinary bytes.
 count, repair-symbol count, payload length, and source/repair datagram ranges so
 callers can reason about recovery budget per fragment instead of inferring it
 from private packet headers.
+`EncodedMediaFrame` also exposes source-first send plans and per-frame FEC
+stats so a transport can prioritize block-fill datagrams, defer lower-priority
+repair, and report overhead without parsing private RaptorQ payloads.
+For multi-frame queues, `plan_media_datagrams` applies the deadline-aware order
+we want contributors to use: audio, codec config, keyframe source, delta
+source, keyframe repair, then delta repair. It also supports pacing offsets,
+in-flight caps, and stale delta-repair drops under queue pressure.
+`NetworkMetricsObservation` adapts real sequence loss, RTT, jitter, queue delay,
+and bitrate inputs into `AdaptiveFecController`. `MediaFecRepairCounters`
+collects repair-effectiveness counters, and `MediaBackfillStore` keeps recent
+encoded datagrams available for reliable-path backfill when loss exceeds parity.
+
+## Useful Deltas From QUIC
+
+RaptorQ-FEC and QUIC solve different parts of the media transport problem.
+This crate should stay focused on bounded, feedback-free repair for datagram
+media paths; QUIC remains the better substrate for sessions, fanout, caching,
+encryption, congestion control, and eventual retransmission.
+
+Useful differences in favor of this crate:
+
+- Recovery does not wait for ACK/NACK feedback, RTT, or QUIC PTO. If loss stays
+  within the repair budget, decode completes as soon as enough source or repair
+  symbols arrive.
+- Datagram loss is repaired at the media block boundary instead of stalling a
+  QUIC stream behind retransmission. That is the main niche for sub-RTT playout
+  budgets such as 33 ms video over 70 ms RTT.
+- The wire format is transport-independent. The same FEC datagrams can ride
+  over UDP, WebTransport datagrams, WebRTC data channels, or a mesh-specific
+  socket path.
+- Repair cost is explicit and media-aware. Audio, keyframes, delta frames, and
+  generic data can use different repair ratios and floors.
+- Failure is bounded and visible: when loss exceeds parity, the frame fails
+  closed instead of pretending to provide eventual reliability.
+
+Useful differences in favor of QUIC/MoQ:
+
+- QUIC has mature congestion control, pacing, TLS, connection migration,
+  stream multiplexing, and retransmission. This crate deliberately does not.
+- QUIC/MoQ model freshness with stream priorities, group ordering, cache
+  windows, and late-join/backfill semantics. RaptorQ repairs the hot path but
+  does not provide a distribution plane.
+- QUIC can eventually recover loss beyond a fixed FEC budget if the application
+  can tolerate the latency. RaptorQ cannot manufacture symbols beyond the
+  repair sent for that block.
+- QUIC implementations have strong socket-level pacing and flow-control
+  behavior. FEC callers still need to avoid dumping large keyframes into the
+  socket without backpressure.
 
 ## Interop Testing
 
@@ -140,6 +188,43 @@ expecting forward repair alone to cover every WAN loss profile.
 (cd ../av-rs && cargo test -p srt --lib)
 (cd ../av-mesh && cargo test fec)
 ```
+
+## Useful QUIC/MoQ Deltas Closed
+
+These are the transport-discipline gaps closed in this crate while preserving
+RaptorQ's role as the feedback-free repair hot path:
+
+- [x] Source-first media frame planning:
+      `EncodedMediaFrame::datagram_send_plan(SourceFirst)` and
+      `scheduled_datagram_send_plan` let callers send source symbols before
+      lower-priority repair.
+- [x] Per-frame pacing and in-flight caps:
+      `MediaSendPolicy` and `MediaQueueState` bound scheduled datagrams and add
+      per-datagram pacing offsets.
+- [x] Deadline-aware send order:
+      `plan_media_datagrams` ranks audio, codec config, keyframe source, delta
+      source, keyframe repair, delta repair, then generic data.
+- [x] Stale delta-repair dropping:
+      the scheduler drops delta repair under configured queue pressure or missed
+      deadline while keeping newer audio/keyframe work ahead.
+- [x] Real metric ingestion:
+      `NetworkMetricsObservation` feeds sequence loss, RTT, jitter, queue delay,
+      and available bitrate into `AdaptiveFecController`.
+- [x] Repair-effectiveness counters:
+      `MediaFecRepairCounters` records source symbols, repair symbols, repaired
+      source loss, unused repair, FEC overhead, failed blocks, send-plan drops,
+      backfill hit/miss counts, and decode deadline misses.
+- [x] Backfill beside FEC:
+      `MediaBackfillStore` keeps recent encoded datagrams as `Bytes` so a
+      reliable path can request full frames or specific missing datagrams after
+      parity is exhausted.
+- [x] Reusable datagram buffers:
+      `DatagramBufferPool`, `encode_*_reusing`, and
+      `MediaFecEncoder::encode_frame_reusing` let callers recycle datagram
+      storage between frames.
+- [x] QUIC/MoQ remains optional:
+      the new APIs expose scheduler, telemetry, and backfill hooks without
+      adding QUIC, TLS, ARQ, or pub-sub semantics to the FEC wire format.
 
 ## Publishing
 

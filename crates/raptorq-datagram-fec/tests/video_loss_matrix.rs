@@ -2933,6 +2933,8 @@ fn video_controller() -> AdaptiveFecController {
         max_source_symbols: 64,
         min_repair_symbols: 0,
         max_repair_symbols: 20,
+        delta_repair_floor_source_symbols: 8,
+        delta_repair_floor_symbols: 1,
         min_repair_ratio: 0.04,
         max_repair_ratio: 0.33,
         keyframe_repair_boost: 0.10,

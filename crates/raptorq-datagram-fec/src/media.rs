@@ -1,6 +1,6 @@
 use crate::{
-    source_symbol_count, AdaptiveFecController, DatagramFecDecoder, DatagramFecEncoder,
-    DatagramFecError, FecDecision, MediaPriority,
+    source_symbol_count, AdaptiveFecController, DatagramBufferPool, DatagramFecDecoder,
+    DatagramFecEncoder, DatagramFecError, FecDecision, MediaPriority,
 };
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
@@ -270,10 +270,137 @@ pub fn decode_serialized_media_access_unit(
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodedMediaFrame {
     pub sequence: u64,
+    pub metadata: MediaFrameMetadata,
+    pub priority: MediaPriority,
     pub fragment_count: u16,
     pub decision: FecDecision,
     pub blocks: Vec<EncodedMediaBlock>,
     pub datagrams: Vec<Vec<u8>>,
+}
+
+impl EncodedMediaFrame {
+    pub fn stats(&self) -> MediaFecFrameStats {
+        let source_datagrams = self
+            .blocks
+            .iter()
+            .map(|block| usize::from(block.source_symbols))
+            .sum::<usize>();
+        let repair_datagrams = self
+            .blocks
+            .iter()
+            .map(|block| block.repair_symbols as usize)
+            .sum::<usize>();
+        let protected_bytes = self
+            .blocks
+            .iter()
+            .map(|block| block.payload_len)
+            .sum::<usize>();
+        let wire_bytes = self
+            .datagrams
+            .iter()
+            .map(|datagram| datagram.len())
+            .sum::<usize>();
+
+        MediaFecFrameStats {
+            block_count: self.blocks.len(),
+            source_datagrams,
+            repair_datagrams,
+            wire_datagrams: self.datagrams.len(),
+            protected_bytes,
+            wire_bytes,
+            recoverable_source_datagrams: self
+                .blocks
+                .iter()
+                .map(|block| block.repair_symbols as usize)
+                .sum(),
+            max_block_datagrams: self
+                .blocks
+                .iter()
+                .map(|block| block.datagram_count)
+                .max()
+                .unwrap_or(0),
+        }
+    }
+
+    pub fn datagram_role(&self, datagram_index: usize) -> Option<MediaDatagramRole> {
+        self.blocks
+            .iter()
+            .find_map(|block| block.datagram_role(datagram_index))
+    }
+
+    pub fn source_first_datagram_indices(&self) -> Vec<usize> {
+        self.datagram_send_plan(MediaDatagramOrder::SourceFirst)
+            .into_iter()
+            .map(|entry| entry.datagram_index)
+            .collect()
+    }
+
+    pub fn datagram_send_plan(&self, order: MediaDatagramOrder) -> Vec<MediaDatagramSend> {
+        let mut plan = Vec::with_capacity(self.datagrams.len());
+        match order {
+            MediaDatagramOrder::Encoded => {
+                for block in &self.blocks {
+                    push_media_datagram_send_entries(&mut plan, block, MediaDatagramRole::Source);
+                    push_media_datagram_send_entries(&mut plan, block, MediaDatagramRole::Repair);
+                }
+            }
+            MediaDatagramOrder::SourceFirst => {
+                for block in &self.blocks {
+                    push_media_datagram_send_entries(&mut plan, block, MediaDatagramRole::Source);
+                }
+                for block in &self.blocks {
+                    push_media_datagram_send_entries(&mut plan, block, MediaDatagramRole::Repair);
+                }
+            }
+        }
+        plan
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaDatagramOrder {
+    Encoded,
+    SourceFirst,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaDatagramRole {
+    Source,
+    Repair,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaDatagramSend {
+    pub datagram_index: usize,
+    pub block_id: u32,
+    pub fragment_index: u16,
+    pub role: MediaDatagramRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MediaFecFrameStats {
+    pub block_count: usize,
+    pub source_datagrams: usize,
+    pub repair_datagrams: usize,
+    pub wire_datagrams: usize,
+    pub protected_bytes: usize,
+    pub wire_bytes: usize,
+    pub recoverable_source_datagrams: usize,
+    pub max_block_datagrams: usize,
+}
+
+impl MediaFecFrameStats {
+    pub fn overhead_bytes(self) -> usize {
+        self.wire_bytes.saturating_sub(self.protected_bytes)
+    }
+
+    pub fn datagram_overhead_ratio(self) -> f32 {
+        if self.source_datagrams == 0 {
+            0.0
+        } else {
+            self.wire_datagrams as f32 / self.source_datagrams as f32
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +439,33 @@ impl EncodedMediaBlock {
                 .first_datagram_index
                 .saturating_add(self.datagram_count)
     }
+
+    pub fn datagram_role(&self, datagram_index: usize) -> Option<MediaDatagramRole> {
+        if self.source_datagram_indices().contains(&datagram_index) {
+            Some(MediaDatagramRole::Source)
+        } else if self.repair_datagram_indices().contains(&datagram_index) {
+            Some(MediaDatagramRole::Repair)
+        } else {
+            None
+        }
+    }
+}
+
+fn push_media_datagram_send_entries(
+    plan: &mut Vec<MediaDatagramSend>,
+    block: &EncodedMediaBlock,
+    role: MediaDatagramRole,
+) {
+    let range = match role {
+        MediaDatagramRole::Source => block.source_datagram_indices(),
+        MediaDatagramRole::Repair => block.repair_datagram_indices(),
+    };
+    plan.extend(range.map(|datagram_index| MediaDatagramSend {
+        datagram_index,
+        block_id: block.block_id,
+        fragment_index: block.fragment_index,
+        role,
+    }));
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +511,22 @@ impl MediaFecEncoder {
     pub fn encode_frame(
         &mut self,
         frame: MediaFrame<'_>,
+    ) -> Result<EncodedMediaFrame, MediaFecError> {
+        self.encode_frame_with_optional_pool(frame, None)
+    }
+
+    pub fn encode_frame_reusing(
+        &mut self,
+        frame: MediaFrame<'_>,
+        pool: &mut DatagramBufferPool,
+    ) -> Result<EncodedMediaFrame, MediaFecError> {
+        self.encode_frame_with_optional_pool(frame, Some(pool))
+    }
+
+    fn encode_frame_with_optional_pool(
+        &mut self,
+        frame: MediaFrame<'_>,
+        mut pool: Option<&mut DatagramBufferPool>,
     ) -> Result<EncodedMediaFrame, MediaFecError> {
         let priority = frame.metadata.priority();
         let initial_decision = self
@@ -416,9 +586,13 @@ impl MediaFecEncoder {
                 .set_symbol_size(initial_decision.config.symbol_size);
             let block_id = self.fec.block_id();
             let first_datagram_index = datagrams.len();
-            let block_datagrams = self
-                .fec
-                .encode_block_with_repair_symbols(&block, repair_symbols)?;
+            let block_datagrams = if let Some(pool) = pool.as_deref_mut() {
+                self.fec
+                    .encode_block_with_repair_symbols_reusing(&block, repair_symbols, pool)?
+            } else {
+                self.fec
+                    .encode_block_with_repair_symbols(&block, repair_symbols)?
+            };
             let datagram_count = block_datagrams.len();
             datagrams.extend(block_datagrams);
             blocks.push(EncodedMediaBlock {
@@ -434,6 +608,8 @@ impl MediaFecEncoder {
 
         Ok(EncodedMediaFrame {
             sequence: frame.metadata.sequence,
+            metadata: frame.metadata,
+            priority,
             fragment_count: fragment_count as u16,
             decision: initial_decision,
             blocks,
@@ -754,6 +930,167 @@ mod tests {
 
         let error = decode_serialized_media_access_unit(Bytes::from(bytes)).unwrap_err();
         assert!(error.contains("payload length mismatch"));
+    }
+
+    #[test]
+    fn default_policy_repairs_large_low_loss_delta_frame() {
+        let mut encoder = MediaFecEncoder::default();
+        let payload = vec![0x31; 18_000];
+        let metadata = MediaFrameMetadata {
+            duration_ms: 16,
+            ..MediaFrameMetadata::new(1, encoder.allocate_sequence(), 1_000, MediaCodec::H264)
+        };
+        let encoded = encoder
+            .encode_frame(MediaFrame {
+                metadata,
+                payload: &payload,
+            })
+            .expect("encode media");
+
+        assert_eq!(encoded.priority, MediaPriority::VideoDelta);
+        assert_eq!(encoded.fragment_count, 1);
+        assert_eq!(encoded.blocks.len(), 1);
+        assert_eq!(
+            encoded.blocks[0].repair_symbols, 1,
+            "large low-loss deltas should get a bounded repair floor"
+        );
+
+        let dropped_source = encoded.blocks[0].source_datagram_indices().start;
+        let mut decoder = MediaFecDecoder::new();
+        let mut decoded = None;
+        for (index, datagram) in encoded.datagrams.iter().enumerate() {
+            if index == dropped_source {
+                continue;
+            }
+            decoded = decoder.push_datagram(datagram).expect("decode media");
+            if decoded.is_some() {
+                break;
+            }
+        }
+
+        let decoded = decoded.expect("complete frame");
+        assert_eq!(decoded.metadata, metadata);
+        assert_eq!(decoded.payload, payload);
+    }
+
+    #[test]
+    fn media_encoder_can_reuse_datagram_buffers() {
+        let mut encoder = MediaFecEncoder::default();
+        let mut pool = DatagramBufferPool::new();
+        let payload = vec![0x44; 4_000];
+        let metadata = MediaFrameMetadata {
+            duration_ms: 16,
+            ..MediaFrameMetadata::new(1, encoder.allocate_sequence(), 1_000, MediaCodec::H264)
+        };
+        let encoded = encoder
+            .encode_frame_reusing(
+                MediaFrame {
+                    metadata,
+                    payload: &payload,
+                },
+                &mut pool,
+            )
+            .expect("encode media");
+        let first_ptr = encoded.datagrams[0].as_ptr();
+        pool.recycle_many(encoded.datagrams);
+
+        let metadata = MediaFrameMetadata {
+            duration_ms: 16,
+            ..MediaFrameMetadata::new(1, encoder.allocate_sequence(), 1_016, MediaCodec::H264)
+        };
+        let encoded = encoder
+            .encode_frame_reusing(
+                MediaFrame {
+                    metadata,
+                    payload: &payload,
+                },
+                &mut pool,
+            )
+            .expect("encode media with recycled buffers");
+
+        assert_eq!(encoded.datagrams[0].as_ptr(), first_ptr);
+    }
+
+    #[test]
+    fn source_first_plan_prioritizes_block_fill_before_repair() {
+        let policy = AdaptiveFecPolicy {
+            min_source_symbols: 4,
+            max_source_symbols: 4,
+            min_repair_symbols: 1,
+            max_repair_symbols: 4,
+            min_repair_ratio: 0.25,
+            max_repair_ratio: 0.5,
+            symbol_size: 96,
+            ..AdaptiveFecPolicy::default()
+        };
+        let controller = AdaptiveFecController::new(policy, CongestionConfig::default());
+        let mut encoder = MediaFecEncoder::new(controller);
+        let payload = vec![0xC7; 1500];
+        let metadata = MediaFrameMetadata {
+            codec: MediaCodec::H264,
+            flags: MediaFrameFlags::keyframe(),
+            ..MediaFrameMetadata::new(1, encoder.allocate_sequence(), 777, MediaCodec::H264)
+        };
+        let encoded = encoder
+            .encode_frame(MediaFrame {
+                metadata,
+                payload: &payload,
+            })
+            .expect("encode media");
+        let stats = encoded.stats();
+
+        assert!(stats.block_count > 1);
+        assert!(stats.repair_datagrams > 0);
+        assert_eq!(stats.wire_datagrams, encoded.datagrams.len());
+        assert_eq!(
+            stats.source_datagrams + stats.repair_datagrams,
+            encoded.datagrams.len()
+        );
+        assert!(stats.overhead_bytes() > 0);
+        assert!(stats.datagram_overhead_ratio() > 1.0);
+
+        let encoded_order = encoded
+            .datagram_send_plan(MediaDatagramOrder::Encoded)
+            .into_iter()
+            .map(|entry| entry.datagram_index)
+            .collect::<Vec<_>>();
+        let source_first = encoded.datagram_send_plan(MediaDatagramOrder::SourceFirst);
+        let source_first_indices = encoded.source_first_datagram_indices();
+
+        assert_eq!(
+            encoded_order,
+            (0..encoded.datagrams.len()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            source_first_indices,
+            source_first
+                .iter()
+                .map(|entry| entry.datagram_index)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            source_first_indices, encoded_order,
+            "multi-block frames should be able to send later source symbols before earlier repair"
+        );
+
+        let mut sorted = source_first_indices.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, encoded_order);
+
+        for entry in source_first.iter().take(stats.source_datagrams) {
+            assert_eq!(entry.role, MediaDatagramRole::Source);
+            assert_eq!(
+                encoded.datagram_role(entry.datagram_index),
+                Some(MediaDatagramRole::Source)
+            );
+        }
+        for entry in source_first.iter().skip(stats.source_datagrams) {
+            assert_eq!(entry.role, MediaDatagramRole::Repair);
+            assert_eq!(
+                encoded.datagram_role(entry.datagram_index),
+                Some(MediaDatagramRole::Repair)
+            );
+        }
     }
 
     #[test]

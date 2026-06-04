@@ -5,19 +5,32 @@
 //! `EncodingPacket`.
 
 mod adaptive;
+mod backfill;
 mod media;
+mod schedule;
 mod sequence;
+mod telemetry;
 
 pub use adaptive::{
     AdaptiveFecController, AdaptiveFecPolicy, CongestionConfig, CongestionDecision, FecDecision,
-    MediaPriority, NetworkMetrics,
+    MediaPriority, NetworkMetrics, NetworkMetricsObservation,
+};
+pub use backfill::{
+    MediaBackfillDatagram, MediaBackfillFrame, MediaBackfillKey, MediaBackfillRequest,
+    MediaBackfillResponse, MediaBackfillStore,
 };
 pub use media::{
     decode_serialized_media_access_unit, DecodedMediaFrame, EncodedMediaBlock, EncodedMediaFrame,
-    MediaCodec, MediaFecDecoder, MediaFecEncoder, MediaFecError, MediaFragmentHeader, MediaFrame,
+    MediaCodec, MediaDatagramOrder, MediaDatagramRole, MediaDatagramSend, MediaFecDecoder,
+    MediaFecEncoder, MediaFecError, MediaFecFrameStats, MediaFragmentHeader, MediaFrame,
     MediaFrameFlags, MediaFrameMetadata, SerializedMediaAccessUnit, MEDIA_FRAME_HEADER_LEN,
 };
+pub use schedule::{
+    plan_media_datagrams, MediaDatagramClass, MediaDropReason, MediaDroppedDatagram,
+    MediaQueueState, MediaScheduledDatagram, MediaSendPlan, MediaSendPolicy,
+};
 pub use sequence::{SequenceObservation, SequenceStats, SequenceTracker};
+pub use telemetry::{MediaFecLossOutcome, MediaFecRepairCounters};
 
 use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation};
 use std::collections::{HashMap, HashSet};
@@ -76,6 +89,61 @@ impl DatagramFecConfig {
 
     pub fn datagram_size(self) -> usize {
         datagram_size_for_symbol_size(self.symbol_size)
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct DatagramBufferPool {
+    buffers: Vec<Vec<u8>>,
+}
+
+impl DatagramBufferPool {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_capacity(buffer_count: usize) -> Self {
+        Self {
+            buffers: Vec::with_capacity(buffer_count),
+        }
+    }
+
+    pub fn available(&self) -> usize {
+        self.buffers.len()
+    }
+
+    pub fn take(&mut self, min_capacity: usize) -> Vec<u8> {
+        let mut best_index = None;
+        let mut best_capacity = usize::MAX;
+        for (index, buffer) in self.buffers.iter().enumerate() {
+            let capacity = buffer.capacity();
+            if capacity >= min_capacity && capacity < best_capacity {
+                best_index = Some(index);
+                best_capacity = capacity;
+            }
+        }
+
+        if let Some(index) = best_index {
+            let mut buffer = self.buffers.swap_remove(index);
+            buffer.clear();
+            buffer
+        } else {
+            Vec::with_capacity(min_capacity)
+        }
+    }
+
+    pub fn recycle(&mut self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        self.buffers.push(buffer);
+    }
+
+    pub fn recycle_many<I>(&mut self, buffers: I)
+    where
+        I: IntoIterator<Item = Vec<u8>>,
+    {
+        for buffer in buffers {
+            self.recycle(buffer);
+        }
     }
 }
 
@@ -489,6 +557,16 @@ impl DatagramFecEncoder {
         self.encode_block_with_repair_symbols(data, self.config.repair_symbols)
     }
 
+    /// Encode exactly one configured FEC block using caller-owned datagram
+    /// buffers for the returned packet storage.
+    pub fn encode_block_reusing(
+        &mut self,
+        data: &[u8],
+        pool: &mut DatagramBufferPool,
+    ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        self.encode_block_with_repair_symbols_reusing(data, self.config.repair_symbols, pool)
+    }
+
     /// Encode one complete application object, even when it needs more source
     /// symbols than the configured low-latency block size.
     pub fn encode_object(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DatagramFecError> {
@@ -529,6 +607,29 @@ impl DatagramFecEncoder {
         self.encode_one_block_with_repair_symbols(data, repair_symbols)
     }
 
+    /// Encode exactly one FEC block with caller-selected repair count and
+    /// caller-owned datagram buffers.
+    pub fn encode_block_with_repair_symbols_reusing(
+        &mut self,
+        data: &[u8],
+        repair_symbols: u32,
+        pool: &mut DatagramBufferPool,
+    ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        if data.len() > u32::MAX as usize {
+            return Err(DatagramFecError::PayloadTooLong { actual: data.len() });
+        }
+
+        let max = self.config.max_payload_len();
+        if data.len() > max {
+            return Err(DatagramFecError::PayloadTooLargeForBlock {
+                actual: data.len(),
+                max,
+            });
+        }
+
+        self.encode_one_block_with_repair_symbols_reusing(data, repair_symbols, pool)
+    }
+
     /// Split `data` into configured block-sized chunks and encode all chunks.
     pub fn encode_payload(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DatagramFecError> {
         if data.len() > u32::MAX as usize {
@@ -548,6 +649,38 @@ impl DatagramFecEncoder {
         Ok(datagrams)
     }
 
+    /// Split `data` into configured block-sized chunks and encode all chunks
+    /// using caller-owned datagram buffers.
+    pub fn encode_payload_reusing(
+        &mut self,
+        data: &[u8],
+        pool: &mut DatagramBufferPool,
+    ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        if data.len() > u32::MAX as usize {
+            return Err(DatagramFecError::PayloadTooLong { actual: data.len() });
+        }
+
+        let mut datagrams = Vec::new();
+        let max_payload_len = self.config.max_payload_len().max(1);
+        for chunk in data.chunks(max_payload_len) {
+            datagrams.extend(self.encode_one_block_with_repair_symbols_reusing(
+                chunk,
+                self.config.repair_symbols,
+                pool,
+            )?);
+        }
+
+        if data.is_empty() {
+            datagrams.extend(self.encode_one_block_with_repair_symbols_reusing(
+                data,
+                self.config.repair_symbols,
+                pool,
+            )?);
+        }
+
+        Ok(datagrams)
+    }
+
     fn encode_one_block(&mut self, data: &[u8]) -> Result<Vec<Vec<u8>>, DatagramFecError> {
         self.encode_one_block_with_repair_symbols(data, self.config.repair_symbols)
     }
@@ -556,6 +689,24 @@ impl DatagramFecEncoder {
         &mut self,
         data: &[u8],
         repair_symbols: u32,
+    ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        self.encode_one_block_with_optional_pool(data, repair_symbols, None)
+    }
+
+    fn encode_one_block_with_repair_symbols_reusing(
+        &mut self,
+        data: &[u8],
+        repair_symbols: u32,
+        pool: &mut DatagramBufferPool,
+    ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        self.encode_one_block_with_optional_pool(data, repair_symbols, Some(pool))
+    }
+
+    fn encode_one_block_with_optional_pool(
+        &mut self,
+        data: &[u8],
+        repair_symbols: u32,
+        mut pool: Option<&mut DatagramBufferPool>,
     ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
         let encoder = Encoder::new(
             data,
@@ -579,7 +730,12 @@ impl DatagramFecEncoder {
                 symbol_size,
                 &serialized,
             )?;
-            let mut datagram = Vec::with_capacity(HEADER_LEN + serialized.len());
+            let mut datagram = if let Some(pool) = pool.as_deref_mut() {
+                pool.take(HEADER_LEN + serialized.len())
+            } else {
+                Vec::with_capacity(HEADER_LEN + serialized.len())
+            };
+            datagram.clear();
             datagram.resize(HEADER_LEN, 0);
             header.encode(&mut datagram[..HEADER_LEN])?;
             datagram.extend_from_slice(&serialized);
@@ -1000,6 +1156,30 @@ mod tests {
             .collect::<HashSet<_>>();
 
         assert_eq!(block_ids.len(), 4);
+    }
+
+    #[test]
+    fn reusable_buffer_pool_recycles_datagram_storage() {
+        let payload = vec![42; 96];
+        let mut encoder = DatagramFecEncoder::new()
+            .with_source_symbols(2)
+            .with_symbol_size(48)
+            .with_repair_symbols(1);
+        let mut pool = DatagramBufferPool::new();
+        let datagrams = encoder
+            .encode_block_reusing(&payload, &mut pool)
+            .expect("encode with pool");
+        let first_capacity = datagrams[0].capacity();
+        let first_ptr = datagrams[0].as_ptr();
+        pool.recycle_many(datagrams);
+
+        let datagrams = encoder
+            .encode_block_reusing(&payload, &mut pool)
+            .expect("encode with recycled pool");
+
+        assert_eq!(pool.available(), 0);
+        assert_eq!(datagrams[0].capacity(), first_capacity);
+        assert_eq!(datagrams[0].as_ptr(), first_ptr);
     }
 
     #[test]

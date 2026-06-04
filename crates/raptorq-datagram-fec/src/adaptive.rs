@@ -1,4 +1,7 @@
-use crate::{source_symbol_count, DatagramFecConfig, DEFAULT_SOURCE_SYMBOLS, DEFAULT_SYMBOL_SIZE};
+use crate::{
+    sequence::SequenceStats, source_symbol_count, DatagramFecConfig, DEFAULT_SOURCE_SYMBOLS,
+    DEFAULT_SYMBOL_SIZE,
+};
 
 const DEFAULT_MIN_REPAIR_RATIO: f32 = 0.05;
 const DEFAULT_MAX_REPAIR_RATIO: f32 = 0.35;
@@ -24,6 +27,48 @@ impl Default for NetworkMetrics {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NetworkMetricsObservation {
+    pub sequence_stats: SequenceStats,
+    pub rtt_ms: f32,
+    pub jitter_ms: f32,
+    pub queue_delay_ms: f32,
+    pub available_bitrate_bps: Option<u64>,
+    pub loss_fraction_override: Option<f32>,
+}
+
+impl NetworkMetricsObservation {
+    pub fn new(sequence_stats: SequenceStats) -> Self {
+        Self {
+            sequence_stats,
+            rtt_ms: 0.0,
+            jitter_ms: 0.0,
+            queue_delay_ms: 0.0,
+            available_bitrate_bps: None,
+            loss_fraction_override: None,
+        }
+    }
+
+    pub fn into_metrics(self) -> NetworkMetrics {
+        NetworkMetrics {
+            loss_fraction: self
+                .loss_fraction_override
+                .unwrap_or_else(|| self.sequence_stats.loss_fraction())
+                .clamp(0.0, 1.0),
+            rtt_ms: self.rtt_ms.max(0.0),
+            jitter_ms: self.jitter_ms.max(0.0),
+            queue_delay_ms: self.queue_delay_ms.max(0.0),
+            available_bitrate_bps: self.available_bitrate_bps,
+        }
+    }
+}
+
+impl From<NetworkMetricsObservation> for NetworkMetrics {
+    fn from(observation: NetworkMetricsObservation) -> Self {
+        observation.into_metrics()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaPriority {
     Audio,
@@ -38,6 +83,8 @@ pub struct AdaptiveFecPolicy {
     pub max_source_symbols: u16,
     pub min_repair_symbols: u32,
     pub max_repair_symbols: u32,
+    pub delta_repair_floor_source_symbols: u16,
+    pub delta_repair_floor_symbols: u32,
     pub min_repair_ratio: f32,
     pub max_repair_ratio: f32,
     pub keyframe_repair_boost: f32,
@@ -52,6 +99,8 @@ impl Default for AdaptiveFecPolicy {
             max_source_symbols: 48,
             min_repair_symbols: 0,
             max_repair_symbols: 16,
+            delta_repair_floor_source_symbols: 8,
+            delta_repair_floor_symbols: 1,
             min_repair_ratio: DEFAULT_MIN_REPAIR_RATIO,
             max_repair_ratio: DEFAULT_MAX_REPAIR_RATIO,
             keyframe_repair_boost: 0.10,
@@ -68,12 +117,16 @@ impl AdaptiveFecPolicy {
         let min_repair_ratio = self.min_repair_ratio.max(0.0);
         let max_repair_ratio = self.max_repair_ratio.max(min_repair_ratio);
         let min_repair_symbols = self.min_repair_symbols.min(self.max_repair_symbols);
+        let delta_repair_floor_symbols =
+            self.delta_repair_floor_symbols.min(self.max_repair_symbols);
 
         Self {
             min_source_symbols,
             max_source_symbols,
             min_repair_symbols,
             max_repair_symbols: self.max_repair_symbols,
+            delta_repair_floor_source_symbols: self.delta_repair_floor_source_symbols.max(1),
+            delta_repair_floor_symbols,
             min_repair_ratio,
             max_repair_ratio,
             keyframe_repair_boost: self.keyframe_repair_boost.max(0.0),
@@ -208,6 +261,13 @@ impl AdaptiveFecController {
         }
     }
 
+    pub fn update_from_observation(
+        &mut self,
+        observation: NetworkMetricsObservation,
+    ) -> CongestionDecision {
+        self.update_network_metrics(observation.into_metrics())
+    }
+
     pub fn decide(&self, payload_len: usize, priority: MediaPriority) -> FecDecision {
         let symbol_size = self.policy.symbol_size.max(1);
         let source_symbols_for_payload = source_symbol_count(payload_len, symbol_size);
@@ -246,8 +306,17 @@ impl AdaptiveFecController {
         } else {
             raw_repair.ceil() as u32
         };
+        let media_floor = match priority {
+            MediaPriority::VideoDelta
+                if source_symbols >= self.policy.delta_repair_floor_source_symbols =>
+            {
+                self.policy.delta_repair_floor_symbols
+            }
+            _ => 0,
+        };
         repair
             .max(self.policy.min_repair_symbols)
+            .max(media_floor)
             .min(self.policy.max_repair_symbols)
     }
 
@@ -309,7 +378,17 @@ mod tests {
 
         assert!(decision.config.source_symbols >= DEFAULT_SOURCE_SYMBOLS);
         assert!(decision.config.repair_symbols < u32::from(decision.source_symbols_for_payload));
+        assert!(decision.config.repair_symbols >= 1);
         assert!(decision.config.repair_symbols <= 4);
+    }
+
+    #[test]
+    fn low_loss_large_delta_gets_repair_floor() {
+        let controller = AdaptiveFecController::default();
+        let decision = controller.decide(18_000, MediaPriority::VideoDelta);
+
+        assert!(decision.source_symbols_for_payload >= 8);
+        assert_eq!(decision.config.repair_symbols, 1);
     }
 
     #[test]
@@ -354,5 +433,32 @@ mod tests {
         let healthy = controller.update_network_metrics(NetworkMetrics::default());
         assert!(!healthy.congestion_limited);
         assert!(controller.target_bitrate_bps() > reduced);
+    }
+
+    #[test]
+    fn observation_updates_metrics_from_sequence_stats_and_queue_state() {
+        let mut controller = AdaptiveFecController::default();
+        let observation = NetworkMetricsObservation {
+            sequence_stats: SequenceStats {
+                received: 90,
+                missing: 10,
+                duplicate_or_reordered: 0,
+                highest_seen: Some(99),
+            },
+            rtt_ms: 42.0,
+            jitter_ms: 7.0,
+            queue_delay_ms: 11.0,
+            available_bitrate_bps: Some(2_000_000),
+            loss_fraction_override: None,
+        };
+
+        controller.update_from_observation(observation);
+        let metrics = controller.metrics();
+
+        assert_eq!(metrics.loss_fraction, 0.10);
+        assert_eq!(metrics.rtt_ms, 42.0);
+        assert_eq!(metrics.jitter_ms, 7.0);
+        assert_eq!(metrics.queue_delay_ms, 11.0);
+        assert_eq!(metrics.available_bitrate_bps, Some(2_000_000));
     }
 }

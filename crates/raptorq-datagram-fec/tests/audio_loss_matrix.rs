@@ -129,6 +129,8 @@ fn audio_controller() -> AdaptiveFecController {
         max_source_symbols: 8,
         min_repair_symbols: 0,
         max_repair_symbols: 2,
+        delta_repair_floor_source_symbols: 8,
+        delta_repair_floor_symbols: 1,
         min_repair_ratio: 0.04,
         max_repair_ratio: 0.5,
         keyframe_repair_boost: 0.10,

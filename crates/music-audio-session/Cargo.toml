@@ -1,0 +1,12 @@
+[package]
+name = "music-audio-session"
+version = "0.1.0"
+edition.workspace = true
+description = "Exact-deadline music audio session primitives over RaptorQ micro-block FEC."
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+raptorq-datagram-fec = { workspace = true, default-features = false }

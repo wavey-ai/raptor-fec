@@ -54,6 +54,15 @@ and bitrate inputs into `AdaptiveFecController`. `MediaFecRepairCounters`
 collects repair-effectiveness counters, and `MediaBackfillStore` keeps recent
 encoded datagrams available for reliable-path backfill when loss exceeds parity.
 
+Music-production audio can use `MusicAudioMicroBlockEncoder` and
+`MusicAudioMicroBlockDecoder` for exact micro-block repair of caller-supplied
+audio chunks. The presets target 48 kHz stereo PCM-shaped chunks at 2.5 ms
+(`4 source + 1 repair`) and 5 ms (`2 source + 1 repair`) block cadence. This is
+not PLC or codec concealment: when enough source or repair datagrams arrive
+before the caller's playout deadline, the decoder returns the exact original
+chunks; when the repair budget is exceeded, the caller decides whether to drop,
+silence, or halt.
+
 ## Useful Deltas From QUIC
 
 RaptorQ-FEC and QUIC solve different parts of the media transport problem.

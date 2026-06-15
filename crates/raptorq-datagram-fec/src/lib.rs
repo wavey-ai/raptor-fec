@@ -5,6 +5,7 @@
 //! `EncodingPacket`.
 
 mod adaptive;
+mod audio;
 mod backfill;
 mod media;
 mod schedule;
@@ -14,6 +15,12 @@ mod telemetry;
 pub use adaptive::{
     AdaptiveFecController, AdaptiveFecPolicy, CongestionConfig, CongestionDecision, FecDecision,
     MediaPriority, NetworkMetrics, NetworkMetricsObservation,
+};
+pub use audio::{
+    decode_music_audio_micro_block_payload, DecodedMusicAudioFrame, DecodedMusicAudioMicroBlock,
+    EncodedMusicAudioMicroBlock, MusicAudioFecError, MusicAudioFrame, MusicAudioMicroBlockConfig,
+    MusicAudioMicroBlockDecoder, MusicAudioMicroBlockEncoder, MUSIC_AUDIO_BLOCK_FIXED_HEADER_LEN,
+    MUSIC_AUDIO_BLOCK_MAGIC, MUSIC_AUDIO_BLOCK_VERSION, MUSIC_AUDIO_FRAME_DESCRIPTOR_LEN,
 };
 pub use backfill::{
     MediaBackfillDatagram, MediaBackfillFrame, MediaBackfillKey, MediaBackfillRequest,

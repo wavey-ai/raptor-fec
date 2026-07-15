@@ -1,0 +1,21 @@
+[package]
+name = "music-audio-session-wasm"
+version = "0.1.0"
+edition.workspace = true
+description = "Browser bindings for same-epoch multichannel RaptorQ audio sessions."
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+js-sys = "0.3"
+music-audio-session = { path = "../music-audio-session" }
+raptorq-fec-transport = { path = "../raptorq-fec-transport" }
+wasm-bindgen.workspace = true
+
+[dev-dependencies]
+raptorq-datagram-fec = { path = "../raptorq-datagram-fec", default-features = false }
+wasm-bindgen-test = "0.3"

@@ -48,6 +48,8 @@ impl MediaFrameFlags {
     pub const CODEC_CONFIG: u16 = 1 << 1;
     pub const DISCONTINUITY: u16 = 1 << 2;
     pub const END_OF_STREAM: u16 = 1 << 3;
+    /// Initialization object required before dependent media can be decoded.
+    pub const INITIALIZATION: u16 = 1 << 4;
 
     pub fn new(bits: u16) -> Self {
         Self(bits)
@@ -55,6 +57,10 @@ impl MediaFrameFlags {
 
     pub fn keyframe() -> Self {
         Self(Self::KEYFRAME)
+    }
+
+    pub fn initialization() -> Self {
+        Self(Self::INITIALIZATION)
     }
 
     pub fn bits(self) -> u16 {

@@ -1,5 +1,6 @@
 use crate::{
-    EncodedMediaFrame, MediaDatagramRole, MediaDropReason, MediaFecFrameStats, MediaSendPlan,
+    EncodedMediaFrame, MediaDatagramRole, MediaDeadlineOutcome, MediaDropReason,
+    MediaFecFrameStats, MediaRecoveryAction, MediaRecoveryDecision, MediaSendPlan,
 };
 use std::collections::HashSet;
 
@@ -31,8 +32,16 @@ pub struct MediaFecRepairCounters {
     pub unused_repair_datagrams: u64,
     pub failed_blocks: u64,
     pub decode_deadline_misses: u64,
+    pub dropped_expired_datagrams: u64,
     pub dropped_stale_repair_datagrams: u64,
     pub dropped_in_flight_limit_datagrams: u64,
+    pub recovery_noop_decisions: u64,
+    pub raptorq_recovery_decisions: u64,
+    pub raptorq_extra_repair_symbols: u64,
+    pub reliable_fetch_recovery_decisions: u64,
+    pub expired_recovery_decisions: u64,
+    pub delivery_deadline_hits: u64,
+    pub delivery_deadline_misses: u64,
     pub backfill_requests: u64,
     pub backfill_hits: u64,
     pub backfill_misses: u64,
@@ -90,17 +99,56 @@ impl MediaFecRepairCounters {
     }
 
     pub fn record_send_plan(&mut self, plan: &MediaSendPlan) {
+        self.dropped_in_flight_limit_datagrams = self
+            .dropped_in_flight_limit_datagrams
+            .saturating_add(plan.blocked_by_in_flight as u64);
         for dropped in &plan.dropped {
             match dropped.reason {
+                MediaDropReason::Expired => {
+                    self.dropped_expired_datagrams =
+                        self.dropped_expired_datagrams.saturating_add(1);
+                }
                 MediaDropReason::StaleDeltaRepair => {
                     self.dropped_stale_repair_datagrams =
                         self.dropped_stale_repair_datagrams.saturating_add(1);
                 }
                 MediaDropReason::InFlightLimit => {
-                    self.dropped_in_flight_limit_datagrams =
-                        self.dropped_in_flight_limit_datagrams.saturating_add(1);
+                    // Compatibility for externally constructed legacy plans.
+                    if plan.blocked_by_in_flight == 0 {
+                        self.dropped_in_flight_limit_datagrams =
+                            self.dropped_in_flight_limit_datagrams.saturating_add(1);
+                    }
                 }
             }
+        }
+    }
+
+    pub fn record_recovery_decision(&mut self, decision: MediaRecoveryDecision) {
+        match decision.action {
+            MediaRecoveryAction::NoRecoveryNeeded => {
+                self.recovery_noop_decisions = self.recovery_noop_decisions.saturating_add(1);
+            }
+            MediaRecoveryAction::SendRaptorQRepair { repair_symbols, .. } => {
+                self.raptorq_recovery_decisions = self.raptorq_recovery_decisions.saturating_add(1);
+                self.raptorq_extra_repair_symbols = self
+                    .raptorq_extra_repair_symbols
+                    .saturating_add(u64::from(repair_symbols));
+            }
+            MediaRecoveryAction::ReliableFetch { .. } => {
+                self.reliable_fetch_recovery_decisions =
+                    self.reliable_fetch_recovery_decisions.saturating_add(1);
+            }
+            MediaRecoveryAction::Expire => {
+                self.expired_recovery_decisions = self.expired_recovery_decisions.saturating_add(1);
+            }
+        }
+    }
+
+    pub fn record_deadline_outcome(&mut self, outcome: MediaDeadlineOutcome) {
+        if outcome.deadline_hit {
+            self.delivery_deadline_hits = self.delivery_deadline_hits.saturating_add(1);
+        } else {
+            self.delivery_deadline_misses = self.delivery_deadline_misses.saturating_add(1);
         }
     }
 
@@ -187,7 +235,10 @@ impl EncodedMediaFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MediaCodec, MediaFecEncoder, MediaFrame, MediaFrameMetadata};
+    use crate::{
+        MediaCodec, MediaDeadline, MediaFecEncoder, MediaFrame, MediaFrameMetadata,
+        MediaQueueState, MediaRecoveryInput, MediaRecoveryPolicy, MediaSendPolicy,
+    };
 
     #[test]
     fn counters_record_repaired_loss_unused_repair_and_plan_drops() {
@@ -211,10 +262,66 @@ mod tests {
         let mut counters = MediaFecRepairCounters::default();
         counters.record_encoded_frame(&encoded);
         counters.record_loss_outcome(outcome);
+        let expired_plan = encoded.scheduled_datagram_send_plan(
+            MediaSendPolicy::default(),
+            MediaQueueState {
+                now_ms: 2_000,
+                ..MediaQueueState::default()
+            },
+        );
+        counters.record_send_plan(&expired_plan);
+        let recovery = MediaRecoveryPolicy::default().decide(MediaRecoveryInput {
+            now_us: 100_000,
+            deadline: MediaDeadline::from_micros(130_000),
+            uncovered_source_symbols: 1,
+            secondary_rtt_us: 8_000,
+            secondary_queue_delay_us: 0,
+            repair_symbol_spacing_us: 250,
+            reliable_fetch_estimate_us: Some(10_000),
+        });
+        counters.record_recovery_decision(recovery);
+        counters.record_recovery_decision(MediaRecoveryPolicy::default().decide(
+            MediaRecoveryInput {
+                now_us: 100_000,
+                deadline: MediaDeadline::from_micros(130_000),
+                uncovered_source_symbols: 1,
+                secondary_rtt_us: 40_000,
+                secondary_queue_delay_us: 0,
+                repair_symbol_spacing_us: 250,
+                reliable_fetch_estimate_us: Some(20_000),
+            },
+        ));
+        counters.record_recovery_decision(MediaRecoveryPolicy::default().decide(
+            MediaRecoveryInput {
+                now_us: 100_000,
+                deadline: MediaDeadline::from_micros(130_000),
+                uncovered_source_symbols: 1,
+                secondary_rtt_us: 40_000,
+                secondary_queue_delay_us: 0,
+                repair_symbol_spacing_us: 250,
+                reliable_fetch_estimate_us: Some(30_000),
+            },
+        ));
+        counters.record_deadline_outcome(
+            MediaDeadline::from_micros(130_000).observe_completion(100_000, 125_000),
+        );
+        counters.record_deadline_outcome(
+            MediaDeadline::from_micros(130_000).observe_completion(100_000, 131_000),
+        );
         assert_eq!(counters.encoded_frames, 1);
         assert_eq!(counters.decoded_frames, 1);
         assert_eq!(counters.repaired_source_datagrams, 1);
         assert!(counters.repair_symbols > 0);
         assert!(counters.fec_overhead_bytes > 0);
+        assert_eq!(
+            counters.dropped_expired_datagrams,
+            encoded.datagrams.len() as u64
+        );
+        assert_eq!(counters.raptorq_recovery_decisions, 1);
+        assert_eq!(counters.raptorq_extra_repair_symbols, 2);
+        assert_eq!(counters.reliable_fetch_recovery_decisions, 1);
+        assert_eq!(counters.expired_recovery_decisions, 1);
+        assert_eq!(counters.delivery_deadline_hits, 1);
+        assert_eq!(counters.delivery_deadline_misses, 1);
     }
 }

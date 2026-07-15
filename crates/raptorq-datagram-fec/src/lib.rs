@@ -5,9 +5,9 @@
 //! `EncodingPacket`.
 
 mod adaptive;
-mod audio;
 mod backfill;
 mod media;
+mod multichannel_audio;
 mod schedule;
 mod sequence;
 mod telemetry;
@@ -15,12 +15,6 @@ mod telemetry;
 pub use adaptive::{
     AdaptiveFecController, AdaptiveFecPolicy, CongestionConfig, CongestionDecision, FecDecision,
     MediaPriority, NetworkMetrics, NetworkMetricsObservation,
-};
-pub use audio::{
-    decode_music_audio_micro_block_payload, DecodedMusicAudioFrame, DecodedMusicAudioMicroBlock,
-    EncodedMusicAudioMicroBlock, MusicAudioFecError, MusicAudioFrame, MusicAudioMicroBlockConfig,
-    MusicAudioMicroBlockDecoder, MusicAudioMicroBlockEncoder, MUSIC_AUDIO_BLOCK_FIXED_HEADER_LEN,
-    MUSIC_AUDIO_BLOCK_MAGIC, MUSIC_AUDIO_BLOCK_VERSION, MUSIC_AUDIO_FRAME_DESCRIPTOR_LEN,
 };
 pub use backfill::{
     MediaBackfillDatagram, MediaBackfillFrame, MediaBackfillKey, MediaBackfillRequest,
@@ -32,9 +26,24 @@ pub use media::{
     MediaFecEncoder, MediaFecError, MediaFecFrameStats, MediaFragmentHeader, MediaFrame,
     MediaFrameFlags, MediaFrameMetadata, SerializedMediaAccessUnit, MEDIA_FRAME_HEADER_LEN,
 };
+pub use multichannel_audio::{
+    AudioPayloadKind, AudioSampleFormat, DecodedMultichannelAudioShard,
+    EncodedMultichannelAudioEpoch, MultichannelAudioDatagram, MultichannelAudioDatagramRole,
+    MultichannelAudioEpoch, MultichannelAudioFecConfig, MultichannelAudioFecDecoder,
+    MultichannelAudioFecEncoder, MultichannelAudioFecError, MultichannelAudioFecGeometry,
+    MultichannelAudioGroup, MultichannelAudioRecovery, MultichannelAudioShardHeader,
+    DEFAULT_AUDIO_MAX_DATAGRAM_SIZE, DEFAULT_AUDIO_MAX_SOURCE_SYMBOLS,
+    DEFAULT_AUDIO_REPAIR_SYMBOLS, MULTICHANNEL_AUDIO_SHARD_HEADER_LEN,
+    MULTICHANNEL_AUDIO_SHARD_MAGIC, MULTICHANNEL_AUDIO_SHARD_VERSION,
+};
 pub use schedule::{
-    plan_media_datagrams, MediaDatagramClass, MediaDropReason, MediaDroppedDatagram,
-    MediaQueueState, MediaScheduledDatagram, MediaSendPlan, MediaSendPolicy,
+    decide_media_recovery, plan_media_datagrams, plan_media_datagrams_with_deadlines,
+    MediaDatagramClass, MediaDeadline, MediaDeadlineOutcome, MediaDropReason, MediaDroppedDatagram,
+    MediaFrameSchedule, MediaObjectKind, MediaPathIntent, MediaQueueState, MediaRecoveryAction,
+    MediaRecoveryDecision, MediaRecoveryInput, MediaRecoveryPolicy, MediaScheduleState,
+    MediaScheduledDatagram, MediaSendPlan, MediaSendPolicy, DEFAULT_MAX_DATAGRAMS_PER_PLAN,
+    HARD_MAX_BLOCK_VISITS_PER_PLAN, HARD_MAX_DATAGRAMS_PER_PLAN, HARD_MAX_EXTRA_REPAIR_SYMBOLS,
+    HARD_MAX_FRAMES_SCANNED_PER_PLAN, URGENT_REPAIR_WINDOW_US,
 };
 pub use sequence::{SequenceObservation, SequenceStats, SequenceTracker};
 pub use telemetry::{MediaFecLossOutcome, MediaFecRepairCounters};
@@ -68,6 +77,15 @@ pub const DEFAULT_SYMBOL_SIZE: u16 = 1316;
 pub const DEFAULT_SOURCE_SYMBOLS: u16 = 4;
 /// Default repair symbols emitted for each block.
 pub const DEFAULT_REPAIR_SYMBOLS: u32 = 1;
+/// RFC 6330 maximum number of source symbols in one RaptorQ source block.
+pub const MAX_SOURCE_SYMBOLS_PER_BLOCK: u32 = 56_403;
+/// RaptorQ payload IDs carry a 24-bit Encoding Symbol ID.
+pub const RAPTORQ_ENCODING_SYMBOL_ID_LIMIT: u32 = 1 << 24;
+/// Absolute canonical-envelope bound admitted by the on-demand repair encoder.
+/// This covers a 16 MiB media payload plus the bounded media-object v1 envelope.
+pub const HARD_MAX_REPAIR_SOURCE_BYTES: usize = 16 * 1024 * 1024 + 256 * 1024;
+/// Absolute allocation bound for one additional-repair response.
+pub const HARD_MAX_ADDITIONAL_REPAIR_BYTES: usize = 16 * 1024 * 1024;
 /// Number of completed block ids retained for duplicate suppression.
 pub const COMPLETED_WINDOW: u32 = 64;
 
@@ -308,6 +326,11 @@ impl DatagramFecHeader {
         datagram_size_for_symbol_size(self.symbol_size)
     }
 
+    /// Return the stable block identity and OTI geometry carried by this packet.
+    pub fn block_profile(&self) -> Result<RaptorQBlockProfile, DatagramFecError> {
+        RaptorQBlockProfile::from_header(*self)
+    }
+
     fn oti(&self) -> ObjectTransmissionInformation {
         exact_one_block_oti(self.transfer_length as u64, self.symbol_size)
     }
@@ -341,31 +364,210 @@ impl DatagramFecHeader {
         if self.packet_flags & !SUPPORTED_PACKET_FLAGS != 0 {
             return Err(DatagramFecError::UnsupportedPacketFlags(self.packet_flags));
         }
-        if self.source_symbols == 0 {
-            return Err(DatagramFecError::InvalidSourceSymbols(self.source_symbols));
-        }
-        if self.symbol_size == 0 {
-            return Err(DatagramFecError::InvalidSymbolSize(self.symbol_size));
-        }
-        Ok(())
+        validate_one_block_geometry(self.transfer_length, self.source_symbols, self.symbol_size)
     }
+}
+
+/// Stable RQD2 block namespace and exact one-block RaptorQ OTI geometry.
+///
+/// A reliable object announcement can carry these four values so independent
+/// parents regenerate symbols in the same RFC 6330 namespace. The caller is
+/// still responsible for binding the profile to an authenticated immutable
+/// object identity and payload hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RaptorQBlockProfile {
+    block_id: u32,
+    transfer_length: u32,
+    source_symbols: u16,
+    symbol_size: u16,
+}
+
+impl RaptorQBlockProfile {
+    pub fn new(
+        block_id: u32,
+        transfer_length: u32,
+        source_symbols: u16,
+        symbol_size: u16,
+    ) -> Result<Self, DatagramFecError> {
+        validate_one_block_geometry(transfer_length, source_symbols, symbol_size)?;
+        Ok(Self {
+            block_id,
+            transfer_length,
+            source_symbols,
+            symbol_size,
+        })
+    }
+
+    pub fn from_header(header: DatagramFecHeader) -> Result<Self, DatagramFecError> {
+        header.validate_fields()?;
+        Self::new(
+            header.block_id,
+            header.transfer_length,
+            header.source_symbols,
+            header.symbol_size,
+        )
+    }
+
+    /// Parse and validate a complete RQD2 source or repair datagram.
+    pub fn from_datagram(datagram: &[u8]) -> Result<Self, DatagramFecError> {
+        if datagram.len() < HEADER_LEN + ENCODING_PACKET_HEADER_LEN {
+            return Err(DatagramFecError::PacketTooShort {
+                actual: datagram.len(),
+            });
+        }
+        let header = DatagramFecHeader::decode(datagram)?;
+        let payload = header.payload(datagram)?;
+        if payload.len() < ENCODING_PACKET_HEADER_LEN {
+            return Err(DatagramFecError::PacketTooShort {
+                actual: datagram.len(),
+            });
+        }
+        let packet = EncodingPacket::deserialize(payload);
+        let source_block_number = packet.payload_id().source_block_number();
+        if source_block_number != 0 {
+            return Err(DatagramFecError::UnsupportedSourceBlockNumber(
+                source_block_number,
+            ));
+        }
+        if packet.data().len() != usize::from(header.symbol_size) {
+            return Err(DatagramFecError::SymbolSizeMismatch {
+                expected: usize::from(header.symbol_size),
+                actual: packet.data().len(),
+            });
+        }
+        Self::from_header(header)
+    }
+
+    pub const fn block_id(self) -> u32 {
+        self.block_id
+    }
+
+    pub const fn transfer_length(self) -> u32 {
+        self.transfer_length
+    }
+
+    pub const fn source_symbols(self) -> u16 {
+        self.source_symbols
+    }
+
+    pub const fn symbol_size(self) -> u16 {
+        self.symbol_size
+    }
+
+    fn oti(self) -> ObjectTransmissionInformation {
+        exact_one_block_oti(u64::from(self.transfer_length), self.symbol_size)
+    }
+}
+
+fn validate_one_block_geometry(
+    transfer_length: u32,
+    source_symbols: u16,
+    symbol_size: u16,
+) -> Result<(), DatagramFecError> {
+    if source_symbols == 0 {
+        return Err(DatagramFecError::InvalidSourceSymbols(source_symbols));
+    }
+    if symbol_size == 0 {
+        return Err(DatagramFecError::InvalidSymbolSize(symbol_size));
+    }
+    if transfer_length == 0 {
+        return Err(DatagramFecError::InvalidTransferLength(transfer_length));
+    }
+
+    let declared_source_symbols = u32::from(source_symbols);
+    if declared_source_symbols > MAX_SOURCE_SYMBOLS_PER_BLOCK {
+        return Err(DatagramFecError::SourceSymbolLimitExceeded {
+            actual: declared_source_symbols,
+            max: MAX_SOURCE_SYMBOLS_PER_BLOCK,
+        });
+    }
+
+    let required_source_symbols = transfer_length.div_ceil(u32::from(symbol_size));
+    if required_source_symbols > MAX_SOURCE_SYMBOLS_PER_BLOCK {
+        return Err(DatagramFecError::SourceSymbolLimitExceeded {
+            actual: required_source_symbols,
+            max: MAX_SOURCE_SYMBOLS_PER_BLOCK,
+        });
+    }
+    if declared_source_symbols != required_source_symbols {
+        return Err(DatagramFecError::SourceSymbolCountMismatch {
+            declared: source_symbols,
+            required: required_source_symbols,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatagramFecError {
-    HeaderTooShort { actual: usize },
-    PacketTooShort { actual: usize },
-    InvalidMagic { actual: [u8; 4] },
+    HeaderTooShort {
+        actual: usize,
+    },
+    PacketTooShort {
+        actual: usize,
+    },
+    InvalidMagic {
+        actual: [u8; 4],
+    },
     UnsupportedVersion(u8),
     UnsupportedHeaderLength(u8),
     UnsupportedPacketKind(u8),
     UnsupportedPacketFlags(u8),
     InvalidSourceSymbols(u16),
     InvalidSymbolSize(u16),
-    PayloadLengthMismatch { expected: usize, actual: usize },
-    PacketCrc32Mismatch { expected: u32, actual: u32 },
-    PayloadTooLong { actual: usize },
-    PayloadTooLargeForBlock { actual: usize, max: usize },
+    InvalidTransferLength(u32),
+    SourceSymbolLimitExceeded {
+        actual: u32,
+        max: u32,
+    },
+    SourceSymbolCountMismatch {
+        declared: u16,
+        required: u32,
+    },
+    PayloadLengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    SymbolSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    UnsupportedSourceBlockNumber(u8),
+    InconsistentBlockGeometry {
+        block_id: u32,
+    },
+    PacketCrc32Mismatch {
+        expected: u32,
+        actual: u32,
+    },
+    PayloadTooLong {
+        actual: usize,
+    },
+    PayloadTooLargeForBlock {
+        actual: usize,
+        max: usize,
+    },
+    TransferLengthMismatch {
+        expected: u32,
+        actual: usize,
+    },
+    RepairSourceTooLarge {
+        actual: usize,
+        max: usize,
+    },
+    AdditionalRepairSymbolCount {
+        actual: u32,
+        max: u32,
+    },
+    AdditionalRepairOutputTooLarge {
+        actual: usize,
+        max: usize,
+    },
+    RepairSymbolIdExhausted {
+        source_symbols: u16,
+        next_repair_symbol: u32,
+        requested: u32,
+    },
 }
 
 impl fmt::Display for DatagramFecError {
@@ -424,10 +626,43 @@ impl fmt::Display for DatagramFecError {
             Self::InvalidSymbolSize(value) => {
                 write!(formatter, "invalid datagram FEC symbol size: {value}")
             }
+            Self::InvalidTransferLength(value) => {
+                write!(formatter, "invalid datagram FEC transfer length: {value}")
+            }
+            Self::SourceSymbolLimitExceeded { actual, max } => {
+                write!(
+                    formatter,
+                    "datagram FEC source symbol count {actual} exceeds the one-block limit {max}"
+                )
+            }
+            Self::SourceSymbolCountMismatch { declared, required } => {
+                write!(
+                    formatter,
+                    "datagram FEC source symbol count mismatch: header declares {declared}, transfer geometry requires {required}"
+                )
+            }
             Self::PayloadLengthMismatch { expected, actual } => {
                 write!(
                     formatter,
                     "datagram FEC payload length mismatch: expected {expected} bytes, got {actual}"
+                )
+            }
+            Self::SymbolSizeMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "datagram FEC symbol size mismatch: expected {expected} bytes, got {actual}"
+                )
+            }
+            Self::UnsupportedSourceBlockNumber(value) => {
+                write!(
+                    formatter,
+                    "datagram FEC source block number must be zero for one-block framing, got {value}"
+                )
+            }
+            Self::InconsistentBlockGeometry { block_id } => {
+                write!(
+                    formatter,
+                    "datagram FEC block {block_id} changed transmission geometry before completion"
                 )
             }
             Self::PacketCrc32Mismatch { expected, actual } => {
@@ -446,6 +681,40 @@ impl fmt::Display for DatagramFecError {
                 write!(
                     formatter,
                     "datagram FEC block payload too large: got {actual} bytes, max is {max}"
+                )
+            }
+            Self::TransferLengthMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "datagram FEC source bytes do not match the coding profile: expected {expected} bytes, got {actual}"
+                )
+            }
+            Self::RepairSourceTooLarge { actual, max } => {
+                write!(
+                    formatter,
+                    "RaptorQ repair source is {actual} bytes, exceeding the {max}-byte bound"
+                )
+            }
+            Self::AdditionalRepairSymbolCount { actual, max } => {
+                write!(
+                    formatter,
+                    "additional RaptorQ repair count must be between 1 and {max}, got {actual}"
+                )
+            }
+            Self::AdditionalRepairOutputTooLarge { actual, max } => {
+                write!(
+                    formatter,
+                    "additional RaptorQ repair output is {actual} bytes, exceeding the {max}-byte bound"
+                )
+            }
+            Self::RepairSymbolIdExhausted {
+                source_symbols,
+                next_repair_symbol,
+                requested,
+            } => {
+                write!(
+                    formatter,
+                    "RaptorQ repair ESI namespace exhausted: K={source_symbols}, next repair ordinal={next_repair_symbol}, requested={requested}"
                 )
             }
         }
@@ -474,6 +743,162 @@ pub fn crc32_ieee_update(previous: u32, bytes: &[u8]) -> u32 {
 
 pub fn packet_crc32(header_without_crc: &[u8], payload: &[u8]) -> u32 {
     crc32_ieee_update(crc32_ieee(header_without_crc), payload)
+}
+
+/// Stateful generator for repair symbols that continue an existing block's ESI namespace.
+///
+/// Construct exactly one instance for each `(authenticated object, block profile)`
+/// repair producer and keep it for the lifetime of that namespace. Every
+/// successful call advances the repair-symbol cursor; failed calls leave it
+/// unchanged. This makes repeated on-demand responses disjoint without tying
+/// the coding operation to UDP, QUIC, or any other carrier.
+#[derive(Debug)]
+pub struct RaptorQRepairEncoder {
+    profile: RaptorQBlockProfile,
+    encoder: Encoder,
+    next_repair_symbol: u32,
+    next_packet_sequence: u32,
+}
+
+impl RaptorQRepairEncoder {
+    /// Recreate an existing source block and continue after repair ordinals
+    /// already emitted by the primary or another repair producer.
+    ///
+    /// `already_emitted_repair_symbols` is the next zero-based repair ordinal:
+    /// if repair ordinals 0, 1, and 2 already exist, pass 3. The RFC 6330 ESI
+    /// of the next packet will be `profile.source_symbols() + 3`.
+    /// `next_packet_sequence` only continues RQD2 flow telemetry; it does not
+    /// participate in the RaptorQ coding identity.
+    pub fn new(
+        source: &[u8],
+        profile: RaptorQBlockProfile,
+        already_emitted_repair_symbols: u32,
+        next_packet_sequence: u32,
+    ) -> Result<Self, DatagramFecError> {
+        validate_one_block_geometry(
+            profile.transfer_length,
+            profile.source_symbols,
+            profile.symbol_size,
+        )?;
+        if profile.transfer_length as usize > HARD_MAX_REPAIR_SOURCE_BYTES {
+            return Err(DatagramFecError::RepairSourceTooLarge {
+                actual: profile.transfer_length as usize,
+                max: HARD_MAX_REPAIR_SOURCE_BYTES,
+            });
+        }
+        if source.len() != profile.transfer_length as usize {
+            return Err(DatagramFecError::TransferLengthMismatch {
+                expected: profile.transfer_length,
+                actual: source.len(),
+            });
+        }
+        validate_repair_symbol_range(profile, already_emitted_repair_symbols, 0)?;
+
+        Ok(Self {
+            profile,
+            encoder: Encoder::new(source, profile.oti()),
+            next_repair_symbol: already_emitted_repair_symbols,
+            next_packet_sequence,
+        })
+    }
+
+    pub const fn profile(&self) -> RaptorQBlockProfile {
+        self.profile
+    }
+
+    /// Zero-based repair ordinal that the next successful call will emit.
+    pub const fn next_repair_symbol(&self) -> u32 {
+        self.next_repair_symbol
+    }
+
+    /// Packet-sequence value that the next successful call will place in RQD2.
+    pub const fn next_packet_sequence(&self) -> u32 {
+        self.next_packet_sequence
+    }
+
+    /// RFC 6330 Encoding Symbol ID of the next repair symbol, or `None` when
+    /// the 24-bit payload-ID namespace is exhausted.
+    pub fn next_encoding_symbol_id(&self) -> Option<u32> {
+        let encoding_symbol_id =
+            u32::from(self.profile.source_symbols).checked_add(self.next_repair_symbol)?;
+        (encoding_symbol_id < RAPTORQ_ENCODING_SYMBOL_ID_LIMIT).then_some(encoding_symbol_id)
+    }
+
+    /// Generate a bounded, disjoint batch of additional repair datagrams.
+    pub fn encode_additional(
+        &mut self,
+        repair_symbols: u32,
+    ) -> Result<Vec<Vec<u8>>, DatagramFecError> {
+        if repair_symbols == 0 || repair_symbols > HARD_MAX_EXTRA_REPAIR_SYMBOLS {
+            return Err(DatagramFecError::AdditionalRepairSymbolCount {
+                actual: repair_symbols,
+                max: HARD_MAX_EXTRA_REPAIR_SYMBOLS,
+            });
+        }
+
+        let output_bytes = datagram_size_for_symbol_size(self.profile.symbol_size)
+            .saturating_mul(repair_symbols as usize);
+        if output_bytes > HARD_MAX_ADDITIONAL_REPAIR_BYTES {
+            return Err(DatagramFecError::AdditionalRepairOutputTooLarge {
+                actual: output_bytes,
+                max: HARD_MAX_ADDITIONAL_REPAIR_BYTES,
+            });
+        }
+        validate_repair_symbol_range(self.profile, self.next_repair_symbol, repair_symbols)?;
+
+        let source_block = self
+            .encoder
+            .get_block_encoders()
+            .first()
+            .expect("validated non-empty one-block OTI has one source block");
+        let packets = source_block.repair_packets(self.next_repair_symbol, repair_symbols);
+        let mut datagrams = Vec::with_capacity(packets.len());
+        let mut packet_sequence = self.next_packet_sequence;
+        for packet in packets {
+            let serialized = packet.serialize();
+            let header = DatagramFecHeader::raptorq(
+                self.profile.block_id,
+                self.profile.transfer_length,
+                packet_sequence,
+                self.profile.source_symbols,
+                self.profile.symbol_size,
+                &serialized,
+            )?;
+            let mut datagram = vec![0; HEADER_LEN];
+            header.encode(&mut datagram)?;
+            datagram.extend_from_slice(&serialized);
+            datagrams.push(datagram);
+            packet_sequence = packet_sequence.wrapping_add(1);
+        }
+
+        self.next_repair_symbol += repair_symbols;
+        self.next_packet_sequence = packet_sequence;
+        Ok(datagrams)
+    }
+}
+
+fn validate_repair_symbol_range(
+    profile: RaptorQBlockProfile,
+    next_repair_symbol: u32,
+    requested: u32,
+) -> Result<(), DatagramFecError> {
+    let Some(end_repair_symbol) = next_repair_symbol.checked_add(requested) else {
+        return Err(DatagramFecError::RepairSymbolIdExhausted {
+            source_symbols: profile.source_symbols,
+            next_repair_symbol,
+            requested,
+        });
+    };
+    let repair_symbol_capacity =
+        RAPTORQ_ENCODING_SYMBOL_ID_LIMIT - u32::from(profile.source_symbols);
+    if end_repair_symbol > repair_symbol_capacity {
+        return Err(DatagramFecError::RepairSymbolIdExhausted {
+            source_symbols: profile.source_symbols,
+            next_repair_symbol,
+            requested,
+        });
+    }
+    Ok(())
 }
 
 /// Stateful RaptorQ encoder that assigns monotonically increasing block ids.
@@ -758,6 +1183,9 @@ impl DatagramFecEncoder {
 #[derive(Debug)]
 struct BlockState {
     decoder: Decoder,
+    transfer_length: u32,
+    source_symbols: u16,
+    symbol_size: u16,
 }
 
 /// Stateful decoder for one ordered datagram flow.
@@ -793,11 +1221,36 @@ impl DatagramFecDecoder {
         }
 
         let packet = EncodingPacket::deserialize(payload);
+        let source_block_number = packet.payload_id().source_block_number();
+        if source_block_number != 0 {
+            return Err(DatagramFecError::UnsupportedSourceBlockNumber(
+                source_block_number,
+            ));
+        }
+        if packet.data().len() != usize::from(header.symbol_size) {
+            return Err(DatagramFecError::SymbolSizeMismatch {
+                expected: usize::from(header.symbol_size),
+                actual: packet.data().len(),
+            });
+        }
+        if self.blocks.get(&header.block_id).is_some_and(|block| {
+            block.transfer_length != header.transfer_length
+                || block.source_symbols != header.source_symbols
+                || block.symbol_size != header.symbol_size
+        }) {
+            self.blocks.remove(&header.block_id);
+            return Err(DatagramFecError::InconsistentBlockGeometry {
+                block_id: header.block_id,
+            });
+        }
         let block = self
             .blocks
             .entry(header.block_id)
             .or_insert_with(|| BlockState {
                 decoder: Decoder::new(header.oti()),
+                transfer_length: header.transfer_length,
+                source_symbols: header.source_symbols,
+                symbol_size: header.symbol_size,
             });
 
         let Some(decoded) = block.decoder.decode(packet) else {
@@ -973,6 +1426,34 @@ pub fn datagram_size_for_symbol_size(symbol_size: u16) -> usize {
 mod tests {
     use super::*;
 
+    fn unchecked_datagram(
+        transfer_length: u32,
+        source_symbols: u16,
+        symbol_size: u16,
+        source_block_number: u8,
+    ) -> Vec<u8> {
+        let payload_len = ENCODING_PACKET_HEADER_LEN + usize::from(symbol_size);
+        let mut datagram = vec![0; HEADER_LEN + payload_len];
+        datagram[0..4].copy_from_slice(&DATAGRAM_MAGIC);
+        datagram[4] = DATAGRAM_VERSION;
+        datagram[5] = HEADER_LEN as u8;
+        datagram[6] = DATAGRAM_KIND_RAPTORQ;
+        datagram[12..16].copy_from_slice(&transfer_length.to_le_bytes());
+        datagram[20..22].copy_from_slice(&source_symbols.to_le_bytes());
+        datagram[22..24].copy_from_slice(&symbol_size.to_le_bytes());
+        datagram[24..28].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        datagram[HEADER_LEN] = source_block_number;
+        datagram
+    }
+
+    fn encoding_symbol_id(datagram: &[u8]) -> u32 {
+        let header = decode_header(datagram).expect("header");
+        let payload = header.payload(datagram).expect("payload");
+        EncodingPacket::deserialize(payload)
+            .payload_id()
+            .encoding_symbol_id()
+    }
+
     #[test]
     fn header_roundtrips() {
         let payload = b"serialized-raptorq-packet";
@@ -1008,6 +1489,78 @@ mod tests {
         assert!(matches!(
             DatagramFecHeader::decode(&bytes),
             Err(DatagramFecError::InvalidMagic { .. })
+        ));
+    }
+
+    #[test]
+    fn decoder_accepts_the_maximum_one_block_source_symbol_geometry() {
+        let datagram = unchecked_datagram(
+            MAX_SOURCE_SYMBOLS_PER_BLOCK,
+            MAX_SOURCE_SYMBOLS_PER_BLOCK as u16,
+            1,
+            0,
+        );
+        let mut decoder = DatagramFecDecoder::new();
+
+        assert_eq!(
+            decoder.push_datagram(&datagram).expect("valid geometry"),
+            None
+        );
+    }
+
+    #[test]
+    fn decoder_rejects_geometry_above_the_one_block_source_symbol_limit() {
+        let source_symbols = MAX_SOURCE_SYMBOLS_PER_BLOCK + 1;
+        let datagram = unchecked_datagram(source_symbols, source_symbols as u16, 1, 0);
+        let mut decoder = DatagramFecDecoder::new();
+
+        assert!(matches!(
+            decoder.push_datagram(&datagram),
+            Err(DatagramFecError::SourceSymbolLimitExceeded {
+                actual,
+                max: MAX_SOURCE_SYMBOLS_PER_BLOCK,
+            }) if actual == source_symbols
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_mismatched_transfer_geometry() {
+        let datagram = unchecked_datagram(129, 2, 64, 0);
+        let mut decoder = DatagramFecDecoder::new();
+
+        assert!(matches!(
+            decoder.push_datagram(&datagram),
+            Err(DatagramFecError::SourceSymbolCountMismatch {
+                declared: 2,
+                required: 3,
+            })
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_zero_transfer_length_and_symbol_size() {
+        let zero_transfer = unchecked_datagram(0, 1, 64, 0);
+        let zero_symbol_size = unchecked_datagram(1, 1, 0, 0);
+        let mut decoder = DatagramFecDecoder::new();
+
+        assert!(matches!(
+            decoder.push_datagram(&zero_transfer),
+            Err(DatagramFecError::InvalidTransferLength(0))
+        ));
+        assert!(matches!(
+            decoder.push_datagram(&zero_symbol_size),
+            Err(DatagramFecError::InvalidSymbolSize(0))
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_nonzero_source_block_number() {
+        let datagram = unchecked_datagram(64, 1, 64, 1);
+        let mut decoder = DatagramFecDecoder::new();
+
+        assert!(matches!(
+            decoder.push_datagram(&datagram),
+            Err(DatagramFecError::UnsupportedSourceBlockNumber(1))
         ));
     }
 
@@ -1121,6 +1674,33 @@ mod tests {
         assert!(matches!(
             decoder.push_datagram(&datagram),
             Err(DatagramFecError::PacketCrc32Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_reused_block_id_with_different_geometry() {
+        let mut first_encoder = DatagramFecEncoder::new()
+            .with_source_symbols(4)
+            .with_symbol_size(64)
+            .with_repair_symbols(1);
+        let mut second_encoder = DatagramFecEncoder::new()
+            .with_source_symbols(4)
+            .with_symbol_size(80)
+            .with_repair_symbols(1);
+        let first = first_encoder
+            .encode_block(&vec![0x11; 200])
+            .expect("encode first flow");
+        let second = second_encoder
+            .encode_block(&vec![0x22; 240])
+            .expect("encode second flow");
+        assert_eq!(decode_header(&first[0]).unwrap().block_id, 0);
+        assert_eq!(decode_header(&second[0]).unwrap().block_id, 0);
+
+        let mut decoder = DatagramFecDecoder::new();
+        assert_eq!(decoder.push_datagram(&first[0]).unwrap(), None);
+        assert!(matches!(
+            decoder.push_datagram(&second[0]),
+            Err(DatagramFecError::InconsistentBlockGeometry { block_id: 0 })
         ));
     }
 
@@ -1247,5 +1827,143 @@ mod tests {
         }
 
         assert_eq!(decoded, Some(payload));
+    }
+
+    #[test]
+    fn secondary_additional_repair_combines_with_primary_source_symbols() {
+        let payload = (0..6001)
+            .map(|index| ((index * 37 + 11) % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut primary = DatagramFecEncoder::new()
+            .with_symbol_size(512)
+            .with_repair_symbols(1)
+            .with_initial_block_id(77);
+        let primary_batch = primary.encode_object(&payload).expect("primary encode");
+        let profile = RaptorQBlockProfile::from_datagram(&primary_batch[0]).expect("profile");
+        let source_symbols = usize::from(profile.source_symbols());
+
+        assert_eq!(primary_batch.len(), source_symbols + 1);
+        assert_eq!(
+            encoding_symbol_id(&primary_batch[source_symbols]),
+            source_symbols as u32
+        );
+
+        let mut secondary =
+            RaptorQRepairEncoder::new(&payload, profile, 1, primary.packet_sequence())
+                .expect("secondary repair encoder");
+        let additional = secondary.encode_additional(6).expect("additional repair");
+        assert_eq!(
+            encoding_symbol_id(&additional[0]),
+            source_symbols as u32 + 1
+        );
+        assert!(additional.iter().all(|datagram| {
+            RaptorQBlockProfile::from_datagram(datagram).expect("repair profile") == profile
+        }));
+
+        let mut decoder = DatagramFecDecoder::new();
+        let mut decoded = None;
+        for (index, datagram) in primary_batch[..source_symbols].iter().enumerate() {
+            if matches!(index, 1 | 5 | 9) {
+                continue;
+            }
+            decoded = decoder.push_datagram(datagram).expect("primary source");
+            assert!(decoded.is_none());
+        }
+        for datagram in additional.iter().rev() {
+            decoded = decoder.push_datagram(datagram).expect("secondary repair");
+            if decoded.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(decoded, Some(payload));
+    }
+
+    #[test]
+    fn additional_repair_cursor_never_reuses_an_encoding_symbol_id() {
+        let payload = vec![0x5a; 700];
+        let profile =
+            RaptorQBlockProfile::new(9, payload.len() as u32, 3, 256).expect("valid profile");
+        let mut repair =
+            RaptorQRepairEncoder::new(&payload, profile, 2, 400).expect("repair encoder");
+
+        let first = repair.encode_additional(2).expect("first response");
+        let second = repair.encode_additional(3).expect("second response");
+        let first_ids = first
+            .iter()
+            .map(|packet| encoding_symbol_id(packet))
+            .collect::<Vec<_>>();
+        let second_ids = second
+            .iter()
+            .map(|packet| encoding_symbol_id(packet))
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_ids, vec![5, 6]);
+        assert_eq!(second_ids, vec![7, 8, 9]);
+        assert!(first_ids.iter().all(|id| !second_ids.contains(id)));
+        assert_eq!(repair.next_repair_symbol(), 7);
+        assert_eq!(repair.next_encoding_symbol_id(), Some(10));
+        assert_eq!(repair.next_packet_sequence(), 405);
+    }
+
+    #[test]
+    fn additional_repair_rejects_geometry_work_and_esi_overflow() {
+        assert!(matches!(
+            RaptorQBlockProfile::new(1, 513, 2, 256),
+            Err(DatagramFecError::SourceSymbolCountMismatch {
+                declared: 2,
+                required: 3,
+            })
+        ));
+
+        let payload = vec![0x42; 512];
+        let profile = RaptorQBlockProfile::new(1, 512, 2, 256).expect("profile");
+        assert!(matches!(
+            RaptorQRepairEncoder::new(&payload[..511], profile, 0, 0),
+            Err(DatagramFecError::TransferLengthMismatch {
+                expected: 512,
+                actual: 511,
+            })
+        ));
+
+        let oversized_length = HARD_MAX_REPAIR_SOURCE_BYTES as u32 + 1;
+        let oversized_symbols = oversized_length.div_ceil(1024) as u16;
+        let oversized_profile =
+            RaptorQBlockProfile::new(1, oversized_length, oversized_symbols, 1024)
+                .expect("valid but operationally excessive profile");
+        assert!(matches!(
+            RaptorQRepairEncoder::new(&[], oversized_profile, 0, 0),
+            Err(DatagramFecError::RepairSourceTooLarge { .. })
+        ));
+
+        let mut repair = RaptorQRepairEncoder::new(&payload, profile, 0, 0).expect("repair");
+        assert!(matches!(
+            repair.encode_additional(0),
+            Err(DatagramFecError::AdditionalRepairSymbolCount { actual: 0, .. })
+        ));
+        assert!(matches!(
+            repair.encode_additional(HARD_MAX_EXTRA_REPAIR_SYMBOLS + 1),
+            Err(DatagramFecError::AdditionalRepairSymbolCount { .. })
+        ));
+        assert_eq!(repair.next_repair_symbol(), 0);
+
+        let namespace_capacity = RAPTORQ_ENCODING_SYMBOL_ID_LIMIT - 2;
+        let mut exhausted = RaptorQRepairEncoder::new(&payload, profile, namespace_capacity - 1, 0)
+            .expect("last available ESI");
+        assert!(matches!(
+            exhausted.encode_additional(2),
+            Err(DatagramFecError::RepairSymbolIdExhausted { .. })
+        ));
+        assert_eq!(exhausted.next_repair_symbol(), namespace_capacity - 1);
+
+        let wide_payload = vec![0x33; u16::MAX as usize];
+        let wide_profile =
+            RaptorQBlockProfile::new(2, u16::MAX as u32, 1, u16::MAX).expect("wide profile");
+        let mut wide =
+            RaptorQRepairEncoder::new(&wide_payload, wide_profile, 0, 0).expect("wide repair");
+        assert!(matches!(
+            wide.encode_additional(257),
+            Err(DatagramFecError::AdditionalRepairOutputTooLarge { .. })
+        ));
     }
 }

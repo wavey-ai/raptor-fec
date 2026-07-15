@@ -7,6 +7,13 @@ This repository contains two public crates:
 - `raptorq-datagram-fec`: the wire protocol, RaptorQ block encoder/decoder, media access-unit framing, adaptive repair policy, congestion state, and optional Tokio UDP sender/receiver helpers.
 - `raptorq-fec-transport`: transport-level wrappers for carrying the same FEC datagrams over WebTransport datagrams and WebRTC data channels without adding a per-datagram stream prefix by default.
 
+For live lossless PCM, read
+[`docs/pcm-low-latency-transport.md`](docs/pcm-low-latency-transport.md) before
+selecting this crate's RaptorQ audio API. RaptorQ is not the default Wavey live
+PCM FEC: paced UDP/RTP with same-epoch XOR or small Reed-Solomon is the primary
+fixed-deadline design, while TCP/TLS is the sustained-throughput and reliable
+recording baseline.
+
 The current datagram wire format is a byte-oriented Wavey RaptorQ v2 packet.
 It is intentionally not TS-, RIST-, or contributor-protocol-aware; ingress and
 egress crates can wrap or unwrap those protocols, but mesh sync should move
@@ -36,7 +43,7 @@ The fixed header is 32 bytes:
 
 Media frames can still use the optional 44-byte protected fragment header above
 the byte payload when a caller wants a `u64` stream id, access-unit sequence,
-PTS/DTS delta, duration, keyframe/config flags, and fragment boundaries. The
+PTS/DTS delta, duration, initialization/keyframe/config flags, and fragment boundaries. The
 RaptorQ datagram layer itself treats that as ordinary bytes.
 `EncodedMediaFrame.blocks` exposes each protected media block's source-symbol
 count, repair-symbol count, payload length, and source/repair datagram ranges so
@@ -45,10 +52,18 @@ from private packet headers.
 `EncodedMediaFrame` also exposes source-first send plans and per-frame FEC
 stats so a transport can prioritize block-fill datagrams, defer lower-priority
 repair, and report overhead without parsing private RaptorQ payloads.
-For multi-frame queues, `plan_media_datagrams` applies the deadline-aware order
-we want contributors to use: audio, codec config, keyframe source, delta
-source, keyframe repair, then delta repair. It also supports pacing offsets,
-in-flight caps, and stale delta-repair drops under queue pressure.
+For multi-frame queues, `plan_media_datagrams_with_deadlines` accepts absolute
+microsecond expiry and emits a bounded source-first plan. Source and repair
+symbols are ordered by initialization, codec configuration, keyframe, audio,
+delta, then data importance. Every source symbol carries primary-path intent;
+every repair symbol carries independent secondary-path intent. Queue delay and
+pacing are included when expired work is removed.
+`MediaRecoveryPolicy` deterministically prefers RaptorQ repair that can arrive
+inside the remaining deadline, selects reliable object fetch when that estimate
+fits instead, and expires obsolete work. Extra repair is hard bounded.
+`MediaDeadlineOutcome` exposes elapsed time, hit/miss, headroom, and lateness for
+deadline-hit and p50/p95/p99 histograms; `MediaFecRepairCounters` separates
+RaptorQ-repair, reliable-fetch, recovery-expiry, and send-expiry outcomes.
 `NetworkMetricsObservation` adapts real sequence loss, RTT, jitter, queue delay,
 and bitrate inputs into `AdaptiveFecController`. `MediaFecRepairCounters`
 collects repair-effectiveness counters, and `MediaBackfillStore` keeps recent
@@ -56,12 +71,19 @@ encoded datagrams available for reliable-path backfill when loss exceeds parity.
 
 Music-production audio can use `MusicAudioMicroBlockEncoder` and
 `MusicAudioMicroBlockDecoder` for exact micro-block repair of caller-supplied
-audio chunks. The presets target 48 kHz stereo PCM-shaped chunks at 2.5 ms
-(`4 source + 1 repair`) and 5 ms (`2 source + 1 repair`) block cadence. This is
-not PLC or codec concealment: when enough source or repair datagrams arrive
-before the caller's playout deadline, the decoder returns the exact original
-chunks; when the repair budget is exceeded, the caller decides whether to drop,
-silence, or halt.
+audio chunks. These are correctness prototypes, not production PCM presets. The
+2.5 ms preset groups four chunks and the 5 ms preset groups two, so both wait for
+10 ms of audio before emitting a block. The 5 ms preset also creates a 2,084-byte
+RQD2 datagram before outer transport overhead, which is not Internet-MTU safe.
+The documented `4 source + 1 repair` result depends on a 960-byte test fixture;
+the config does not define PCM sample representation or bit depth. See the PCM
+transport note above for the complete limitations and replacement direction.
+
+This API is not PLC or codec concealment: when enough source or repair datagrams
+arrive, the decoder returns the exact original chunks; when the repair budget is
+exceeded, the caller decides whether to drop, silence, or halt. The caller owns
+the actual monotonic playout deadline; `playout_delay_samples` does not currently
+schedule or enforce one.
 
 ## Useful Deltas From QUIC
 
@@ -69,6 +91,11 @@ RaptorQ-FEC and QUIC solve different parts of the media transport problem.
 This crate should stay focused on bounded, feedback-free repair for datagram
 media paths; QUIC remains the better substrate for sessions, fanout, caching,
 encryption, congestion control, and eventual retransmission.
+
+This functional comparison is not a continuous-PCM throughput recommendation.
+Wavey uses measured TCP/TLS as the bulk PCM baseline and paced UDP/RTP as the
+native fixed-deadline lane. QUIC/WebTransport remains a browser/datagram
+comparison lane.
 
 Useful differences in favor of this crate:
 
@@ -207,12 +234,16 @@ RaptorQ's role as the feedback-free repair hot path:
       `EncodedMediaFrame::datagram_send_plan(SourceFirst)` and
       `scheduled_datagram_send_plan` let callers send source symbols before
       lower-priority repair.
-- [x] Per-frame pacing and in-flight caps:
-      `MediaSendPolicy` and `MediaQueueState` bound scheduled datagrams and add
+- [x] Per-frame pacing and admission caps:
+      `MediaSendPolicy` bounds each pass and in-flight work while adding
       per-datagram pacing offsets.
-- [x] Deadline-aware send order:
-      `plan_media_datagrams` ranks audio, codec config, keyframe source, delta
-      source, keyframe repair, delta repair, then generic data.
+- [x] Absolute deadline-aware send order:
+      `plan_media_datagrams_with_deadlines` applies strict source-first ordering,
+      explicit initialization/config/keyframe/audio/delta importance, and
+      primary-source/secondary-repair path intent.
+- [x] Deadline-based recovery choice:
+      `MediaRecoveryPolicy` chooses bounded extra RaptorQ, reliable fetch, or
+      expiry from the remaining deadline and path RTT/fetch estimates.
 - [x] Stale delta-repair dropping:
       the scheduler drops delta repair under configured queue pressure or missed
       deadline while keeping newer audio/keyframe work ahead.
@@ -222,7 +253,7 @@ RaptorQ's role as the feedback-free repair hot path:
 - [x] Repair-effectiveness counters:
       `MediaFecRepairCounters` records source symbols, repair symbols, repaired
       source loss, unused repair, FEC overhead, failed blocks, send-plan drops,
-      backfill hit/miss counts, and decode deadline misses.
+      recovery choices, backfill hit/miss counts, and delivery deadline outcomes.
 - [x] Backfill beside FEC:
       `MediaBackfillStore` keeps recent encoded datagrams as `Bytes` so a
       reliable path can request full frames or specific missing datagrams after
@@ -231,9 +262,9 @@ RaptorQ's role as the feedback-free repair hot path:
       `DatagramBufferPool`, `encode_*_reusing`, and
       `MediaFecEncoder::encode_frame_reusing` let callers recycle datagram
       storage between frames.
-- [x] QUIC/MoQ remains optional:
-      the new APIs expose scheduler, telemetry, and backfill hooks without
-      adding QUIC, TLS, ARQ, or pub-sub semantics to the FEC wire format.
+- [x] Carrier-neutral integration:
+      scheduler, telemetry, recovery, and backfill hooks map onto UDP, QUIC
+      Datagram, or another paced carrier while the FEC wire format stays stable.
 
 ## Publishing
 

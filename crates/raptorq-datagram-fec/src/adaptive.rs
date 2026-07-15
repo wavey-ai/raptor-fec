@@ -269,7 +269,7 @@ impl AdaptiveFecController {
     }
 
     pub fn decide(&self, payload_len: usize, priority: MediaPriority) -> FecDecision {
-        let symbol_size = self.policy.symbol_size.max(1);
+        let symbol_size = self.symbol_size_for_payload(payload_len, priority);
         let source_symbols_for_payload = source_symbol_count(payload_len, symbol_size);
         let source_symbols = source_symbols_for_payload
             .max(self.policy.min_source_symbols)
@@ -296,11 +296,8 @@ impl AdaptiveFecController {
         let raw_repair = f32::from(source_symbols) * repair_ratio;
         let repair = if raw_repair < 1.0 {
             match priority {
-                MediaPriority::Audio | MediaPriority::VideoKey
-                    if repair_ratio > self.policy.min_repair_ratio =>
-                {
-                    1
-                }
+                MediaPriority::Audio if self.metrics.loss_fraction > 0.0 => 1,
+                MediaPriority::VideoKey if repair_ratio > self.policy.min_repair_ratio => 1,
                 _ => 0,
             }
         } else {
@@ -318,6 +315,21 @@ impl AdaptiveFecController {
             .max(self.policy.min_repair_symbols)
             .max(media_floor)
             .min(self.policy.max_repair_symbols)
+    }
+
+    fn symbol_size_for_payload(&self, payload_len: usize, priority: MediaPriority) -> u16 {
+        let configured = self.policy.symbol_size.max(1);
+        if priority != MediaPriority::Audio {
+            return configured;
+        }
+
+        // Opus/AAC access units are commonly much smaller than an Internet-MTU
+        // symbol. RaptorQ serializes every source and repair symbol at the
+        // configured size, so using the video-oriented 1,316-byte default for a
+        // roughly 100-200 byte protected audio block would waste more than 90%
+        // of every datagram. Audio blocks get an exact-fit symbol while larger
+        // media retains the configured MTU-sized geometry.
+        configured.min(payload_len.clamp(1, usize::from(u16::MAX)) as u16)
     }
 
     pub fn repair_ratio(&self, priority: MediaPriority) -> f32 {
@@ -399,6 +411,41 @@ mod tests {
         assert_eq!(decision.source_symbols_for_payload, 1);
         assert_eq!(decision.config.repair_symbols, 0);
         assert_eq!(decision.expected_datagrams, 1);
+    }
+
+    #[test]
+    fn clean_link_small_audio_uses_exact_fit_symbol_without_full_repair() {
+        let controller = AdaptiveFecController::default();
+        let protected_audio_bytes = 172;
+        let decision = controller.decide(protected_audio_bytes, MediaPriority::Audio);
+
+        assert_eq!(decision.config.symbol_size, protected_audio_bytes as u16);
+        assert_eq!(decision.source_symbols_for_payload, 1);
+        assert_eq!(decision.config.repair_symbols, 0);
+        assert_eq!(decision.expected_datagrams, 1);
+    }
+
+    #[test]
+    fn observed_audio_loss_enables_small_block_repair() {
+        let mut controller = AdaptiveFecController::default();
+        controller.update_network_metrics(NetworkMetrics {
+            loss_fraction: 0.02,
+            ..NetworkMetrics::default()
+        });
+
+        let decision = controller.decide(172, MediaPriority::Audio);
+
+        assert_eq!(decision.source_symbols_for_payload, 1);
+        assert_eq!(decision.config.repair_symbols, 1);
+        assert_eq!(decision.expected_datagrams, 2);
+    }
+
+    #[test]
+    fn video_keeps_configured_mtu_symbol_size() {
+        let controller = AdaptiveFecController::default();
+        let decision = controller.decide(172, MediaPriority::VideoDelta);
+
+        assert_eq!(decision.config.symbol_size, DEFAULT_SYMBOL_SIZE);
     }
 
     #[test]

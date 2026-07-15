@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/music-audio-session",
+    "crates/music-audio-session-wasm",
     "crates/raptorq-datagram-fec",
     "crates/raptorq-fec-transport",
 ]
@@ -19,3 +20,4 @@ bytes = "1.5"
 raptorq-datagram-fec = { path = "crates/raptorq-datagram-fec", version = "0.1.3", default-features = false }
 raptorq = { version = "2", default-features = false }
 tokio = { version = "1.45", default-features = false }
+wasm-bindgen = "0.2"

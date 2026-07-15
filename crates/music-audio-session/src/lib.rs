@@ -1,499 +1,906 @@
-//! Exact-deadline music audio session primitives.
+//! Same-epoch multichannel audio session primitives.
 //!
-//! This crate is the caller layer above `raptorq-datagram-fec`'s music
-//! micro-block API. It deliberately does not open sockets, talk to an audio
-//! device, or synthesize missing audio. A transport adapter supplies datagrams,
-//! and an audio callback asks the playout buffer for exact chunks by sample PTS.
+//! A sender encodes every channel/stem group for one playout timestamp as one
+//! RaptorQ object. A receiver exposes complete systematic groups immediately,
+//! uses repair symbols only for missing shards from that timestamp, and returns
+//! exact-or-missing epochs at playout. No API in this crate batches audio across
+//! timestamps or synthesizes replacement samples.
 
 use bytes::Bytes;
 use raptorq_datagram_fec::{
-    DecodedMusicAudioFrame, MusicAudioFecError, MusicAudioFrame, MusicAudioMicroBlockConfig,
-    MusicAudioMicroBlockDecoder, MusicAudioMicroBlockEncoder,
+    AudioPayloadKind, AudioSampleFormat, DecodedMultichannelAudioShard,
+    EncodedMultichannelAudioEpoch, MultichannelAudioEpoch, MultichannelAudioFecConfig,
+    MultichannelAudioFecDecoder, MultichannelAudioFecEncoder, MultichannelAudioFecError,
+    MultichannelAudioRecovery, MultichannelAudioShardHeader,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
+const DEFAULT_MAX_INFLIGHT_EPOCHS: usize = 64;
+const DEFAULT_MAX_BUFFERED_EPOCHS: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MusicAudioSessionConfig {
-    pub micro_block: MusicAudioMicroBlockConfig,
-    pub playout_delay_samples: u32,
-    pub max_buffered_frames: usize,
+pub struct MultichannelAudioSessionConfig {
+    pub fec: MultichannelAudioFecConfig,
+    pub max_inflight_epochs: usize,
+    pub max_buffered_epochs: usize,
 }
 
-impl MusicAudioSessionConfig {
-    pub fn pcm48_stereo_2_5ms(stream_id: u64) -> Self {
+impl Default for MultichannelAudioSessionConfig {
+    fn default() -> Self {
         Self {
-            micro_block: MusicAudioMicroBlockConfig::pcm48_stereo_2_5ms(stream_id),
-            playout_delay_samples: 480,
-            max_buffered_frames: 256,
+            fec: MultichannelAudioFecConfig::default(),
+            max_inflight_epochs: DEFAULT_MAX_INFLIGHT_EPOCHS,
+            max_buffered_epochs: DEFAULT_MAX_BUFFERED_EPOCHS,
         }
     }
+}
 
-    pub fn pcm48_stereo_5ms(stream_id: u64) -> Self {
-        Self {
-            micro_block: MusicAudioMicroBlockConfig::pcm48_stereo_5ms(stream_id),
-            playout_delay_samples: 480,
-            max_buffered_frames: 256,
-        }
-    }
-
+impl MultichannelAudioSessionConfig {
     pub fn normalized(self) -> Self {
         Self {
-            micro_block: self.micro_block.normalized(),
-            playout_delay_samples: self.playout_delay_samples.max(1),
-            max_buffered_frames: self.max_buffered_frames.max(1),
+            fec: self.fec,
+            max_inflight_epochs: self.max_inflight_epochs.max(1),
+            max_buffered_epochs: self.max_buffered_epochs.max(1),
         }
     }
-}
-
-impl Default for MusicAudioSessionConfig {
-    fn default() -> Self {
-        Self::pcm48_stereo_2_5ms(0)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapturedAudioChunk {
-    pub pts_samples: u64,
-    pub payload: Bytes,
-}
-
-impl CapturedAudioChunk {
-    pub fn new(pts_samples: u64, payload: impl Into<Bytes>) -> Self {
-        Self {
-            pts_samples,
-            payload: payload.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutboundMusicAudioDatagram {
-    pub sequence: u64,
-    pub first_pts_samples: u64,
-    pub datagram_index: usize,
-    pub datagram_count: usize,
-    pub payload: Bytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct MusicAudioSessionStats {
-    pub chunks_accepted: u64,
-    pub fec_blocks_emitted: u64,
-    pub datagrams_emitted: u64,
+pub struct MultichannelAudioSessionStats {
+    pub epochs_encoded: u64,
+    pub source_datagrams_emitted: u64,
+    pub repair_datagrams_emitted: u64,
     pub datagrams_received: u64,
-    pub fec_blocks_recovered: u64,
-    pub frames_buffered: u64,
-    pub exact_frames_played: u64,
-    pub missing_frames: u64,
-    pub stale_frames_dropped: u64,
-    pub duplicate_or_late_frames: u64,
+    pub systematic_shards_received: u64,
+    pub raptorq_shards_recovered: u64,
+    pub groups_completed: u64,
+    pub epochs_completed: u64,
+    pub exact_epochs_played: u64,
+    pub missing_epochs: u64,
+    pub incomplete_epochs_dropped: u64,
+    pub stale_epochs_dropped: u64,
+    pub duplicate_or_late_epochs: u64,
 }
 
 #[derive(Debug, Clone)]
-pub struct MusicAudioSender {
-    encoder: MusicAudioMicroBlockEncoder,
-    next_sequence: u64,
-    stats: MusicAudioSessionStats,
+pub struct MultichannelAudioSender {
+    encoder: MultichannelAudioFecEncoder,
+    stats: MultichannelAudioSessionStats,
 }
 
-impl MusicAudioSender {
-    pub fn new(config: MusicAudioSessionConfig) -> Self {
+impl MultichannelAudioSender {
+    pub fn new(config: MultichannelAudioSessionConfig) -> Self {
         Self {
-            encoder: MusicAudioMicroBlockEncoder::new(config.normalized().micro_block),
-            next_sequence: 0,
-            stats: MusicAudioSessionStats::default(),
+            encoder: MultichannelAudioFecEncoder::new(config.normalized().fec),
+            stats: MultichannelAudioSessionStats::default(),
         }
     }
 
-    pub fn next_sequence(&self) -> u64 {
-        self.next_sequence
+    /// Select the first FEC block identifier used by this sender.
+    pub fn with_initial_block_id(mut self, block_id: u32) -> Self {
+        self.encoder.set_block_id(block_id);
+        self
     }
 
-    pub fn pending_frames(&self) -> usize {
-        self.encoder.pending_frames()
+    /// Set the FEC block identifier used by the next encoded epoch.
+    pub fn set_block_id(&mut self, block_id: u32) {
+        self.encoder.set_block_id(block_id);
     }
 
-    pub fn stats(&self) -> MusicAudioSessionStats {
+    /// Return the FEC block identifier that will be used by the next epoch.
+    pub fn block_id(&self) -> u32 {
+        self.encoder.block_id()
+    }
+
+    pub fn fec_config(&self) -> MultichannelAudioFecConfig {
+        self.encoder.config()
+    }
+
+    pub fn fec_config_mut(&mut self) -> &mut MultichannelAudioFecConfig {
+        self.encoder.config_mut()
+    }
+
+    pub fn stats(&self) -> MultichannelAudioSessionStats {
         self.stats
     }
 
-    pub fn push_chunk(
+    pub fn encode_epoch(
         &mut self,
-        chunk: CapturedAudioChunk,
-    ) -> Result<Vec<OutboundMusicAudioDatagram>, MusicAudioSessionError> {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        self.stats.chunks_accepted = self.stats.chunks_accepted.saturating_add(1);
-
-        let encoded = self.encoder.push_frame(MusicAudioFrame {
-            sequence,
-            pts_samples: chunk.pts_samples,
-            payload: &chunk.payload,
-        })?;
-
-        Ok(self.outbound_datagrams(encoded))
-    }
-
-    pub fn flush(&mut self) -> Result<Vec<OutboundMusicAudioDatagram>, MusicAudioSessionError> {
-        let encoded = self.encoder.flush()?;
-        Ok(self.outbound_datagrams(encoded))
-    }
-
-    fn outbound_datagrams(
-        &mut self,
-        encoded: Option<raptorq_datagram_fec::EncodedMusicAudioMicroBlock>,
-    ) -> Vec<OutboundMusicAudioDatagram> {
-        let Some(encoded) = encoded else {
-            return Vec::new();
-        };
-
-        let datagrams = encoded_block_to_outbound_datagrams(encoded);
-        self.stats.fec_blocks_emitted = self.stats.fec_blocks_emitted.saturating_add(1);
-        self.stats.datagrams_emitted = self
+        epoch: MultichannelAudioEpoch<'_>,
+    ) -> Result<EncodedMultichannelAudioEpoch, MultichannelAudioSessionError> {
+        let encoded = self.encoder.encode_epoch(epoch)?;
+        self.stats.epochs_encoded = self.stats.epochs_encoded.saturating_add(1);
+        self.stats.source_datagrams_emitted = self
             .stats
-            .datagrams_emitted
-            .saturating_add(datagrams.len() as u64);
-        datagrams
+            .source_datagrams_emitted
+            .saturating_add(encoded.source_datagram_count() as u64);
+        self.stats.repair_datagrams_emitted = self
+            .stats
+            .repair_datagrams_emitted
+            .saturating_add(encoded.repair_datagram_count() as u64);
+        Ok(encoded)
     }
 }
 
-fn encoded_block_to_outbound_datagrams(
-    encoded: raptorq_datagram_fec::EncodedMusicAudioMicroBlock,
-) -> Vec<OutboundMusicAudioDatagram> {
-    let datagram_count = encoded.datagrams.len();
-    encoded
-        .datagrams
-        .into_iter()
-        .enumerate()
-        .map(|(datagram_index, payload)| OutboundMusicAudioDatagram {
-            sequence: encoded.first_sequence,
-            first_pts_samples: encoded.first_pts_samples,
-            datagram_index,
-            datagram_count,
-            payload: Bytes::from(payload),
-        })
-        .collect()
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedMultichannelAudioGroup {
+    pub session_id: u64,
+    pub config_generation: u32,
+    pub epoch_id: u64,
+    pub pts_samples: u64,
+    pub sample_rate: u32,
+    pub frame_count: u32,
+    pub group_count: u16,
+    pub group_id: u16,
+    pub group_index: u16,
+    pub channel_start: u16,
+    pub channel_count: u16,
+    pub payload_kind: AudioPayloadKind,
+    pub sample_format: AudioSampleFormat,
+    pub flags: u8,
+    pub payload: Bytes,
+    pub raptorq_recovered_fragments: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedMultichannelAudioEpoch {
+    pub session_id: u64,
+    pub config_generation: u32,
+    pub epoch_id: u64,
+    pub pts_samples: u64,
+    pub sample_rate: u32,
+    pub frame_count: u32,
+    pub groups: Vec<DecodedMultichannelAudioGroup>,
+}
+
+impl DecodedMultichannelAudioEpoch {
+    pub fn raptorq_recovered_fragments(&self) -> u32 {
+        self.groups
+            .iter()
+            .map(|group| u32::from(group.raptorq_recovered_fragments))
+            .sum()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MultichannelAudioReceiveOutcome {
+    /// Groups that became complete while processing this datagram.
+    pub completed_groups: Vec<DecodedMultichannelAudioGroup>,
+    /// Set once every group from this FEC block is exact. This completion event
+    /// is independent of the optional one-epoch-per-PTS playout buffer, so two
+    /// representations (for example Opus and PCM) may share a PTS without one
+    /// suppressing the other's live completion.
+    pub completed_epoch: Option<DecodedMultichannelAudioEpoch>,
 }
 
 #[derive(Debug)]
-pub struct MusicAudioReceiver {
-    decoder: MusicAudioMicroBlockDecoder,
-    playout: ExactPlayoutBuffer,
-    stats: MusicAudioSessionStats,
+pub struct MultichannelAudioReceiver {
+    decoder: MultichannelAudioFecDecoder,
+    inflight: HashMap<u32, EpochAssembly>,
+    inflight_order: VecDeque<u32>,
+    ignored_blocks: HashSet<u32>,
+    ignored_order: VecDeque<u32>,
+    max_inflight_epochs: usize,
+    max_ignored_blocks: usize,
+    playout: ExactMultichannelAudioPlayoutBuffer,
+    stats: MultichannelAudioSessionStats,
 }
 
-impl MusicAudioReceiver {
-    pub fn new(config: MusicAudioSessionConfig) -> Self {
+impl MultichannelAudioReceiver {
+    pub fn new(config: MultichannelAudioSessionConfig) -> Self {
+        let config = config.normalized();
         Self {
-            decoder: MusicAudioMicroBlockDecoder::new(),
-            playout: ExactPlayoutBuffer::new(config.normalized().max_buffered_frames),
-            stats: MusicAudioSessionStats::default(),
+            decoder: MultichannelAudioFecDecoder::new(),
+            inflight: HashMap::new(),
+            inflight_order: VecDeque::new(),
+            ignored_blocks: HashSet::new(),
+            ignored_order: VecDeque::new(),
+            max_inflight_epochs: config.max_inflight_epochs,
+            max_ignored_blocks: config.max_inflight_epochs.saturating_mul(4).max(64),
+            playout: ExactMultichannelAudioPlayoutBuffer::new(config.max_buffered_epochs),
+            stats: MultichannelAudioSessionStats::default(),
         }
     }
 
-    pub fn stats(&self) -> MusicAudioSessionStats {
+    pub fn stats(&self) -> MultichannelAudioSessionStats {
         self.stats
     }
 
-    pub fn playout(&self) -> &ExactPlayoutBuffer {
-        &self.playout
+    pub fn sequence_stats(&self) -> raptorq_datagram_fec::SequenceStats {
+        self.decoder.sequence_stats()
     }
 
-    pub fn playout_mut(&mut self) -> &mut ExactPlayoutBuffer {
-        &mut self.playout
+    pub fn playout(&self) -> &ExactMultichannelAudioPlayoutBuffer {
+        &self.playout
     }
 
     pub fn push_datagram(
         &mut self,
         datagram: &[u8],
-    ) -> Result<Option<Vec<DecodedMusicAudioFrame>>, MusicAudioSessionError> {
+    ) -> Result<MultichannelAudioReceiveOutcome, MultichannelAudioSessionError> {
         self.stats.datagrams_received = self.stats.datagrams_received.saturating_add(1);
-        let Some(block) = self.decoder.push_datagram(datagram)? else {
-            return Ok(None);
-        };
+        let shards = self.decoder.push_datagram(datagram)?;
+        let mut outcome = MultichannelAudioReceiveOutcome::default();
 
-        self.stats.fec_blocks_recovered = self.stats.fec_blocks_recovered.saturating_add(1);
-        let mut frames = Vec::with_capacity(block.frames.len());
-        for frame in block.frames {
-            match self.playout.insert(frame.clone()) {
-                InsertFrameOutcome::Inserted => {
-                    self.stats.frames_buffered = self.stats.frames_buffered.saturating_add(1);
+        for shard in shards {
+            match shard.recovery {
+                MultichannelAudioRecovery::Systematic => {
+                    self.stats.systematic_shards_received =
+                        self.stats.systematic_shards_received.saturating_add(1);
                 }
-                InsertFrameOutcome::DuplicateOrLate => {
-                    self.stats.duplicate_or_late_frames =
-                        self.stats.duplicate_or_late_frames.saturating_add(1);
-                }
-                InsertFrameOutcome::EvictedStale(count) => {
-                    self.stats.frames_buffered = self.stats.frames_buffered.saturating_add(1);
-                    self.stats.stale_frames_dropped =
-                        self.stats.stale_frames_dropped.saturating_add(count as u64);
+                MultichannelAudioRecovery::RaptorQ => {
+                    self.stats.raptorq_shards_recovered =
+                        self.stats.raptorq_shards_recovered.saturating_add(1);
                 }
             }
-            frames.push(frame);
+
+            let block_id = shard.block_id;
+            if self.ignored_blocks.contains(&block_id) || self.is_late(shard.header.pts_samples) {
+                continue;
+            }
+            self.ensure_inflight_slot(block_id);
+
+            let assembly = self.inflight.entry(block_id).or_insert_with(|| {
+                self.inflight_order.push_back(block_id);
+                EpochAssembly::new(block_id, shard.header)
+            });
+            let completed_group = assembly.push(shard)?;
+            if let Some(group) = completed_group {
+                self.stats.groups_completed = self.stats.groups_completed.saturating_add(1);
+                outcome.completed_groups.push(group);
+            }
+
+            if self
+                .inflight
+                .get(&block_id)
+                .is_some_and(EpochAssembly::is_complete)
+            {
+                let assembly = self
+                    .inflight
+                    .remove(&block_id)
+                    .expect("completed assembly exists");
+                self.inflight_order
+                    .retain(|candidate| *candidate != block_id);
+                let epoch = assembly.finish()?;
+                self.stats.epochs_completed = self.stats.epochs_completed.saturating_add(1);
+                match self.playout.insert(epoch.clone()) {
+                    InsertEpochOutcome::Inserted => {}
+                    InsertEpochOutcome::DuplicateOrLate => {
+                        self.stats.duplicate_or_late_epochs =
+                            self.stats.duplicate_or_late_epochs.saturating_add(1);
+                    }
+                    InsertEpochOutcome::EvictedStale(count) => {
+                        self.stats.stale_epochs_dropped =
+                            self.stats.stale_epochs_dropped.saturating_add(count as u64);
+                    }
+                }
+                outcome.completed_epoch = Some(epoch);
+            }
         }
 
-        Ok(Some(frames))
+        Ok(outcome)
     }
 
-    pub fn take_for_playout(&mut self, pts_samples: u64) -> PlayoutRead {
+    pub fn take_for_playout(&mut self, pts_samples: u64) -> MultichannelAudioPlayoutRead {
+        self.abandon_inflight_through(pts_samples);
         match self.playout.take_for_playout(pts_samples) {
-            PlayoutRead::Exact(frame) => {
-                self.stats.exact_frames_played = self.stats.exact_frames_played.saturating_add(1);
-                PlayoutRead::Exact(frame)
+            MultichannelAudioPlayoutRead::Exact(epoch) => {
+                self.stats.exact_epochs_played = self.stats.exact_epochs_played.saturating_add(1);
+                MultichannelAudioPlayoutRead::Exact(epoch)
             }
-            PlayoutRead::Missing { pts_samples } => {
-                self.stats.missing_frames = self.stats.missing_frames.saturating_add(1);
-                PlayoutRead::Missing { pts_samples }
+            MultichannelAudioPlayoutRead::Missing { pts_samples } => {
+                self.stats.missing_epochs = self.stats.missing_epochs.saturating_add(1);
+                MultichannelAudioPlayoutRead::Missing { pts_samples }
             }
         }
     }
 
     pub fn expire_before(&mut self, pts_samples: u64) -> usize {
-        let dropped = self.playout.expire_before(pts_samples);
-        self.stats.stale_frames_dropped = self
+        let stale_buffered = self.playout.expire_before(pts_samples);
+        let stale_blocks: Vec<_> = self
+            .inflight
+            .iter()
+            .filter_map(|(block_id, epoch)| (epoch.pts_samples < pts_samples).then_some(*block_id))
+            .collect();
+        for block_id in stale_blocks.iter().copied() {
+            self.drop_inflight(block_id);
+        }
+        let dropped = stale_buffered + stale_blocks.len();
+        self.stats.stale_epochs_dropped = self
             .stats
-            .stale_frames_dropped
+            .stale_epochs_dropped
             .saturating_add(dropped as u64);
         dropped
+    }
+
+    fn is_late(&self, pts_samples: u64) -> bool {
+        self.playout
+            .last_played_pts()
+            .is_some_and(|last| pts_samples <= last)
+    }
+
+    fn ensure_inflight_slot(&mut self, block_id: u32) {
+        if self.inflight.contains_key(&block_id) {
+            return;
+        }
+        while self.inflight.len() >= self.max_inflight_epochs {
+            let Some(oldest) = self.inflight_order.pop_front() else {
+                break;
+            };
+            if self.inflight.remove(&oldest).is_some() {
+                self.stats.incomplete_epochs_dropped =
+                    self.stats.incomplete_epochs_dropped.saturating_add(1);
+                self.remember_ignored(oldest);
+            }
+        }
+    }
+
+    fn abandon_inflight_through(&mut self, pts_samples: u64) {
+        let blocks: Vec<_> = self
+            .inflight
+            .iter()
+            .filter_map(|(block_id, epoch)| (epoch.pts_samples <= pts_samples).then_some(*block_id))
+            .collect();
+        for block_id in blocks {
+            self.drop_inflight(block_id);
+            self.stats.incomplete_epochs_dropped =
+                self.stats.incomplete_epochs_dropped.saturating_add(1);
+        }
+    }
+
+    fn drop_inflight(&mut self, block_id: u32) {
+        self.inflight.remove(&block_id);
+        self.inflight_order
+            .retain(|candidate| *candidate != block_id);
+        self.remember_ignored(block_id);
+    }
+
+    fn remember_ignored(&mut self, block_id: u32) {
+        if self.ignored_blocks.insert(block_id) {
+            self.ignored_order.push_back(block_id);
+        }
+        while self.ignored_order.len() > self.max_ignored_blocks {
+            if let Some(expired) = self.ignored_order.pop_front() {
+                self.ignored_blocks.remove(&expired);
+            }
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlayoutRead {
-    Exact(DecodedMusicAudioFrame),
+pub enum MultichannelAudioPlayoutRead {
+    Exact(DecodedMultichannelAudioEpoch),
     Missing { pts_samples: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InsertFrameOutcome {
+pub enum InsertEpochOutcome {
     Inserted,
     DuplicateOrLate,
     EvictedStale(usize),
 }
 
 #[derive(Debug, Default)]
-pub struct ExactPlayoutBuffer {
-    frames: BTreeMap<u64, DecodedMusicAudioFrame>,
-    max_buffered_frames: usize,
+pub struct ExactMultichannelAudioPlayoutBuffer {
+    epochs: BTreeMap<u64, DecodedMultichannelAudioEpoch>,
+    max_buffered_epochs: usize,
     last_played_pts: Option<u64>,
 }
 
-impl ExactPlayoutBuffer {
-    pub fn new(max_buffered_frames: usize) -> Self {
+impl ExactMultichannelAudioPlayoutBuffer {
+    pub fn new(max_buffered_epochs: usize) -> Self {
         Self {
-            frames: BTreeMap::new(),
-            max_buffered_frames: max_buffered_frames.max(1),
+            epochs: BTreeMap::new(),
+            max_buffered_epochs: max_buffered_epochs.max(1),
             last_played_pts: None,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.frames.len()
+        self.epochs.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
+        self.epochs.is_empty()
     }
 
     pub fn contains_pts(&self, pts_samples: u64) -> bool {
-        self.frames.contains_key(&pts_samples)
+        self.epochs.contains_key(&pts_samples)
     }
 
-    pub fn insert(&mut self, frame: DecodedMusicAudioFrame) -> InsertFrameOutcome {
+    pub fn last_played_pts(&self) -> Option<u64> {
+        self.last_played_pts
+    }
+
+    pub fn insert(&mut self, epoch: DecodedMultichannelAudioEpoch) -> InsertEpochOutcome {
         if self
             .last_played_pts
-            .map(|last| frame.pts_samples <= last)
-            .unwrap_or(false)
-            || self.frames.contains_key(&frame.pts_samples)
+            .is_some_and(|last| epoch.pts_samples <= last)
+            || self.epochs.contains_key(&epoch.pts_samples)
         {
-            return InsertFrameOutcome::DuplicateOrLate;
+            return InsertEpochOutcome::DuplicateOrLate;
         }
 
-        self.frames.insert(frame.pts_samples, frame);
-        if self.frames.len() <= self.max_buffered_frames {
-            return InsertFrameOutcome::Inserted;
+        self.epochs.insert(epoch.pts_samples, epoch);
+        if self.epochs.len() <= self.max_buffered_epochs {
+            return InsertEpochOutcome::Inserted;
         }
 
-        let overflow = self.frames.len() - self.max_buffered_frames;
-        for pts in self
-            .frames
-            .keys()
-            .copied()
-            .take(overflow)
-            .collect::<Vec<_>>()
-        {
-            self.frames.remove(&pts);
+        let overflow = self.epochs.len() - self.max_buffered_epochs;
+        let stale: Vec<_> = self.epochs.keys().copied().take(overflow).collect();
+        for pts_samples in stale {
+            self.epochs.remove(&pts_samples);
         }
-        InsertFrameOutcome::EvictedStale(overflow)
+        InsertEpochOutcome::EvictedStale(overflow)
     }
 
-    pub fn take_for_playout(&mut self, pts_samples: u64) -> PlayoutRead {
+    pub fn take_for_playout(&mut self, pts_samples: u64) -> MultichannelAudioPlayoutRead {
         self.last_played_pts = Some(pts_samples);
         self.expire_before(pts_samples);
-
-        match self.frames.remove(&pts_samples) {
-            Some(frame) => PlayoutRead::Exact(frame),
-            None => PlayoutRead::Missing { pts_samples },
+        match self.epochs.remove(&pts_samples) {
+            Some(epoch) => MultichannelAudioPlayoutRead::Exact(epoch),
+            None => MultichannelAudioPlayoutRead::Missing { pts_samples },
         }
     }
 
     pub fn expire_before(&mut self, pts_samples: u64) -> usize {
         let stale: Vec<_> = self
-            .frames
+            .epochs
             .keys()
             .copied()
             .take_while(|pts| *pts < pts_samples)
             .collect();
-        let count = stale.len();
-        for pts in stale {
-            self.frames.remove(&pts);
+        for pts in &stale {
+            self.epochs.remove(pts);
         }
-        count
+        stale.len()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MusicAudioSessionError {
-    Fec(MusicAudioFecError),
+#[derive(Debug)]
+struct EpochAssembly {
+    block_id: u32,
+    session_id: u64,
+    config_generation: u32,
+    epoch_id: u64,
+    pts_samples: u64,
+    sample_rate: u32,
+    frame_count: u32,
+    group_count: u16,
+    source_count: u16,
+    groups: Vec<Option<DecodedMultichannelAudioGroup>>,
+    partial_groups: HashMap<u16, GroupAssembly>,
 }
 
-impl From<MusicAudioFecError> for MusicAudioSessionError {
-    fn from(error: MusicAudioFecError) -> Self {
+impl EpochAssembly {
+    fn new(block_id: u32, header: MultichannelAudioShardHeader) -> Self {
+        Self {
+            block_id,
+            session_id: header.session_id,
+            config_generation: header.config_generation,
+            epoch_id: header.epoch_id,
+            pts_samples: header.pts_samples,
+            sample_rate: header.sample_rate,
+            frame_count: header.frame_count,
+            group_count: header.group_count,
+            source_count: header.source_count,
+            groups: vec![None; usize::from(header.group_count)],
+            partial_groups: HashMap::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        shard: DecodedMultichannelAudioShard,
+    ) -> Result<Option<DecodedMultichannelAudioGroup>, MultichannelAudioSessionError> {
+        self.validate_header(shard.header)?;
+        let group_index = shard.header.group_index;
+        if self.groups[usize::from(group_index)].is_some() {
+            return Ok(None);
+        }
+
+        let group = self
+            .partial_groups
+            .entry(group_index)
+            .or_insert_with(|| GroupAssembly::new(self.block_id, shard.header));
+        let Some(completed) = group.push(shard)? else {
+            return Ok(None);
+        };
+        self.partial_groups.remove(&group_index);
+        self.groups[usize::from(group_index)] = Some(completed.clone());
+        Ok(Some(completed))
+    }
+
+    fn validate_header(
+        &self,
+        header: MultichannelAudioShardHeader,
+    ) -> Result<(), MultichannelAudioSessionError> {
+        macro_rules! require_equal {
+            ($field:ident) => {
+                if self.$field != header.$field {
+                    return Err(MultichannelAudioSessionError::EpochMetadataMismatch {
+                        block_id: self.block_id,
+                        field: stringify!($field),
+                    });
+                }
+            };
+        }
+        require_equal!(session_id);
+        require_equal!(config_generation);
+        require_equal!(epoch_id);
+        require_equal!(pts_samples);
+        require_equal!(sample_rate);
+        require_equal!(frame_count);
+        require_equal!(group_count);
+        require_equal!(source_count);
+        Ok(())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.groups.iter().all(Option::is_some)
+    }
+
+    fn finish(self) -> Result<DecodedMultichannelAudioEpoch, MultichannelAudioSessionError> {
+        let groups = self.groups.into_iter().collect::<Option<Vec<_>>>().ok_or(
+            MultichannelAudioSessionError::IncompleteEpoch {
+                block_id: self.block_id,
+            },
+        )?;
+        Ok(DecodedMultichannelAudioEpoch {
+            session_id: self.session_id,
+            config_generation: self.config_generation,
+            epoch_id: self.epoch_id,
+            pts_samples: self.pts_samples,
+            sample_rate: self.sample_rate,
+            frame_count: self.frame_count,
+            groups,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct GroupAssembly {
+    block_id: u32,
+    header: MultichannelAudioShardHeader,
+    fragments: Vec<Option<Fragment>>,
+    recovered_fragments: u16,
+}
+
+impl GroupAssembly {
+    fn new(block_id: u32, header: MultichannelAudioShardHeader) -> Self {
+        Self {
+            block_id,
+            header,
+            fragments: vec![None; usize::from(header.fragment_count)],
+            recovered_fragments: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        shard: DecodedMultichannelAudioShard,
+    ) -> Result<Option<DecodedMultichannelAudioGroup>, MultichannelAudioSessionError> {
+        self.validate_header(shard.header)?;
+        let fragment_index = usize::from(shard.header.fragment_index);
+        if self.fragments[fragment_index].is_some() {
+            return Ok(None);
+        }
+        if matches!(shard.recovery, MultichannelAudioRecovery::RaptorQ) {
+            self.recovered_fragments = self.recovered_fragments.saturating_add(1);
+        }
+        self.fragments[fragment_index] = Some(Fragment {
+            offset: shard.header.payload_offset,
+            payload: shard.payload,
+        });
+        if self.fragments.iter().any(Option::is_none) {
+            return Ok(None);
+        }
+
+        let mut fragments = self.fragments.iter().flatten().cloned().collect::<Vec<_>>();
+        fragments.sort_by_key(|fragment| fragment.offset);
+        let mut payload = Vec::with_capacity(self.header.group_payload_len as usize);
+        for fragment in fragments {
+            if fragment.offset as usize != payload.len() {
+                return Err(MultichannelAudioSessionError::NonContiguousGroupPayload {
+                    block_id: shard.block_id,
+                    group_index: self.header.group_index,
+                });
+            }
+            payload.extend_from_slice(&fragment.payload);
+        }
+        if payload.len() != self.header.group_payload_len as usize {
+            return Err(MultichannelAudioSessionError::NonContiguousGroupPayload {
+                block_id: shard.block_id,
+                group_index: self.header.group_index,
+            });
+        }
+
+        Ok(Some(DecodedMultichannelAudioGroup {
+            session_id: self.header.session_id,
+            config_generation: self.header.config_generation,
+            epoch_id: self.header.epoch_id,
+            pts_samples: self.header.pts_samples,
+            sample_rate: self.header.sample_rate,
+            frame_count: self.header.frame_count,
+            group_count: self.header.group_count,
+            group_id: self.header.group_id,
+            group_index: self.header.group_index,
+            channel_start: self.header.channel_start,
+            channel_count: self.header.channel_count,
+            payload_kind: self.header.payload_kind,
+            sample_format: self.header.sample_format,
+            flags: self.header.flags,
+            payload: Bytes::from(payload),
+            raptorq_recovered_fragments: self.recovered_fragments,
+        }))
+    }
+
+    fn validate_header(
+        &self,
+        header: MultichannelAudioShardHeader,
+    ) -> Result<(), MultichannelAudioSessionError> {
+        macro_rules! require_equal {
+            ($field:ident) => {
+                if self.header.$field != header.$field {
+                    return Err(MultichannelAudioSessionError::GroupMetadataMismatch {
+                        block_id: self.block_id,
+                        group_index: self.header.group_index,
+                        field: stringify!($field),
+                    });
+                }
+            };
+        }
+        require_equal!(group_id);
+        require_equal!(group_index);
+        require_equal!(channel_start);
+        require_equal!(channel_count);
+        require_equal!(payload_kind);
+        require_equal!(sample_format);
+        require_equal!(flags);
+        require_equal!(fragment_count);
+        require_equal!(group_payload_len);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Fragment {
+    offset: u32,
+    payload: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultichannelAudioSessionError {
+    Fec(MultichannelAudioFecError),
+    EpochMetadataMismatch {
+        block_id: u32,
+        field: &'static str,
+    },
+    GroupMetadataMismatch {
+        block_id: u32,
+        group_index: u16,
+        field: &'static str,
+    },
+    NonContiguousGroupPayload {
+        block_id: u32,
+        group_index: u16,
+    },
+    IncompleteEpoch {
+        block_id: u32,
+    },
+}
+
+impl From<MultichannelAudioFecError> for MultichannelAudioSessionError {
+    fn from(error: MultichannelAudioFecError) -> Self {
         Self::Fec(error)
     }
 }
 
-impl fmt::Display for MusicAudioSessionError {
+impl fmt::Display for MultichannelAudioSessionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Fec(error) => write!(formatter, "{error}"),
+            Self::EpochMetadataMismatch { block_id, field } => {
+                write!(
+                    formatter,
+                    "audio epoch block {block_id} has inconsistent {field}"
+                )
+            }
+            Self::GroupMetadataMismatch {
+                block_id,
+                group_index,
+                field,
+            } => write!(
+                formatter,
+                "audio epoch block {block_id} group {group_index} has inconsistent {field}"
+            ),
+            Self::NonContiguousGroupPayload {
+                block_id,
+                group_index,
+            } => write!(
+                formatter,
+                "audio epoch block {block_id} group {group_index} payload is not contiguous"
+            ),
+            Self::IncompleteEpoch { block_id } => {
+                write!(formatter, "audio epoch block {block_id} is incomplete")
+            }
         }
     }
 }
 
-impl std::error::Error for MusicAudioSessionError {}
+impl std::error::Error for MultichannelAudioSessionError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raptorq_datagram_fec::MultichannelAudioGroup;
 
     #[test]
-    fn session_recovers_exact_music_chunks_into_playout_buffer() {
-        let config = MusicAudioSessionConfig::pcm48_stereo_2_5ms(9);
-        let mut sender = MusicAudioSender::new(config);
-        let mut datagrams = Vec::new();
+    fn sender_encodes_each_timestamp_immediately_and_source_first() {
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig::default());
+        let payload = test_payload(7, 2_000);
+        let groups = [pcm_group(0, 0, 2, &payload)];
+        let encoded = sender.encode_epoch(epoch(1, 0, &groups)).unwrap();
 
-        for index in 0..4 {
-            let emitted = sender
-                .push_chunk(CapturedAudioChunk::new(
-                    index * 120,
-                    test_payload(index as u8, 960),
-                ))
-                .unwrap();
-            datagrams.extend(emitted);
-        }
+        assert!(encoded.source_datagram_count() > 1);
+        assert_eq!(encoded.repair_datagram_count(), 4);
+        assert!(encoded.datagrams[..encoded.source_datagram_count()]
+            .iter()
+            .all(|packet| matches!(
+                packet.role,
+                raptorq_datagram_fec::MultichannelAudioDatagramRole::Source { .. }
+            )));
+        assert_eq!(sender.stats().epochs_encoded, 1);
+    }
 
-        assert_eq!(datagrams.len(), 5);
-        assert_eq!(sender.stats().chunks_accepted, 4);
-        assert_eq!(sender.stats().fec_blocks_emitted, 1);
-        assert_eq!(sender.stats().datagrams_emitted, 5);
+    #[test]
+    fn receiver_emits_complete_systematic_groups_before_epoch_completion() {
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig::default());
+        let first = test_payload(1, 128);
+        let second = test_payload(2, 128);
+        let groups = [pcm_group(10, 0, 2, &first), pcm_group(11, 2, 2, &second)];
+        let encoded = sender.encode_epoch(epoch(2, 240, &groups)).unwrap();
+        let mut receiver =
+            MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
 
-        let mut receiver = MusicAudioReceiver::new(config);
-        for datagram in datagrams
+        let first_outcome = receiver
+            .push_datagram(&encoded.datagrams[0].payload)
+            .unwrap();
+        assert_eq!(first_outcome.completed_groups.len(), 1);
+        assert_eq!(first_outcome.completed_groups[0].payload.as_ref(), first);
+        assert!(first_outcome.completed_epoch.is_none());
+
+        let second_outcome = receiver
+            .push_datagram(&encoded.datagrams[1].payload)
+            .unwrap();
+        assert_eq!(second_outcome.completed_groups.len(), 1);
+        assert!(second_outcome.completed_epoch.is_some());
+    }
+
+    #[test]
+    fn same_epoch_raptorq_loss_recovery_reaches_exact_playout() {
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig::default());
+        let payloads = (0..8)
+            .map(|group| test_payload(group as u8, 1_700))
+            .collect::<Vec<_>>();
+        let groups = payloads
             .iter()
             .enumerate()
-            .filter(|(index, _)| *index != 1)
-            .map(|(_, datagram)| datagram)
-        {
-            receiver.push_datagram(&datagram.payload).unwrap();
-        }
+            .map(|(index, payload)| pcm_group(index as u16, index as u16 * 2, 2, payload))
+            .collect::<Vec<_>>();
+        let encoded = sender.encode_epoch(epoch(3, 480, &groups)).unwrap();
+        let mut receiver =
+            MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
 
-        for index in 0..4 {
-            match receiver.take_for_playout(index * 120) {
-                PlayoutRead::Exact(frame) => {
-                    assert_eq!(frame.sequence, index);
-                    assert_eq!(frame.pts_samples, index * 120);
-                    assert_eq!(frame.payload.as_ref(), test_payload(index as u8, 960));
-                }
-                PlayoutRead::Missing { pts_samples } => {
-                    panic!("expected exact frame at {pts_samples}");
-                }
+        let dropped_sources = [1usize, 7, 11];
+        for (index, datagram) in encoded.datagrams.iter().enumerate() {
+            if !dropped_sources.contains(&index) {
+                receiver.push_datagram(&datagram.payload).unwrap();
             }
         }
-        assert_eq!(receiver.stats().fec_blocks_recovered, 1);
-        assert_eq!(receiver.stats().exact_frames_played, 4);
-        assert_eq!(receiver.stats().missing_frames, 0);
+
+        let exact = match receiver.take_for_playout(480) {
+            MultichannelAudioPlayoutRead::Exact(epoch) => epoch,
+            MultichannelAudioPlayoutRead::Missing { .. } => panic!("expected recovered epoch"),
+        };
+        assert_eq!(exact.groups.len(), groups.len());
+        for (decoded, expected) in exact.groups.iter().zip(payloads.iter()) {
+            assert_eq!(decoded.payload.as_ref(), expected.as_slice());
+        }
+        assert_eq!(exact.raptorq_recovered_fragments(), 3);
+        assert_eq!(receiver.stats().raptorq_shards_recovered, 3);
     }
 
     #[test]
-    fn receiver_reports_missing_instead_of_faking_audio() {
-        let config = MusicAudioSessionConfig::pcm48_stereo_2_5ms(1);
-        let mut sender = MusicAudioSender::new(config);
-        let mut datagrams = Vec::new();
-        for index in 0..4 {
-            datagrams.extend(
-                sender
-                    .push_chunk(CapturedAudioChunk::new(
-                        index * 120,
-                        test_payload(index as u8, 960),
-                    ))
-                    .unwrap(),
-            );
-        }
+    fn playout_deadline_abandons_incomplete_epoch_and_rejects_late_repair() {
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig::default());
+        let payload = test_payload(9, 2_500);
+        let groups = [pcm_group(0, 0, 2, &payload)];
+        let encoded = sender.encode_epoch(epoch(4, 720, &groups)).unwrap();
+        let mut receiver =
+            MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
 
-        let mut receiver = MusicAudioReceiver::new(config);
-        for datagram in datagrams
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| *index >= 2)
-            .map(|(_, datagram)| datagram)
-        {
-            receiver.push_datagram(&datagram.payload).unwrap();
-        }
-
+        receiver
+            .push_datagram(&encoded.datagrams[0].payload)
+            .unwrap();
         assert_eq!(
-            receiver.take_for_playout(0),
-            PlayoutRead::Missing { pts_samples: 0 }
+            receiver.take_for_playout(720),
+            MultichannelAudioPlayoutRead::Missing { pts_samples: 720 }
         );
-        assert_eq!(receiver.stats().missing_frames, 1);
-        assert_eq!(receiver.stats().exact_frames_played, 0);
+        for datagram in &encoded.datagrams[1..] {
+            let outcome = receiver.push_datagram(&datagram.payload).unwrap();
+            assert!(outcome.completed_epoch.is_none());
+        }
+        assert_eq!(receiver.stats().missing_epochs, 1);
+        assert_eq!(receiver.stats().incomplete_epochs_dropped, 1);
     }
 
     #[test]
-    fn playout_buffer_expires_stale_frames_and_rejects_late_insert() {
-        let mut buffer = ExactPlayoutBuffer::new(2);
-        assert_eq!(
-            buffer.insert(decoded_frame(0)),
-            InsertFrameOutcome::Inserted
-        );
-        assert_eq!(
-            buffer.insert(decoded_frame(120)),
-            InsertFrameOutcome::Inserted
-        );
-        assert_eq!(
-            buffer.insert(decoded_frame(240)),
-            InsertFrameOutcome::EvictedStale(1)
-        );
-        assert!(!buffer.contains_pts(0));
+    fn live_completion_reports_distinct_blocks_that_share_a_pts() {
+        let mut sender = MultichannelAudioSender::new(MultichannelAudioSessionConfig::default());
+        let first_payload = test_payload(1, 200);
+        let second_payload = test_payload(2, 200);
+        let first_groups = [pcm_group(0, 0, 2, &first_payload)];
+        let second_groups = [pcm_group(1, 2, 2, &second_payload)];
+        let first = sender.encode_epoch(epoch(20, 960, &first_groups)).unwrap();
+        let second = sender.encode_epoch(epoch(21, 960, &second_groups)).unwrap();
+        let mut receiver =
+            MultichannelAudioReceiver::new(MultichannelAudioSessionConfig::default());
 
-        assert_eq!(buffer.expire_before(240), 1);
-        assert!(!buffer.contains_pts(120));
-        assert_eq!(
-            buffer.take_for_playout(240),
-            PlayoutRead::Exact(decoded_frame(240))
-        );
-        assert_eq!(
-            buffer.insert(decoded_frame(120)),
-            InsertFrameOutcome::DuplicateOrLate
-        );
+        let mut first_completion = None;
+        for datagram in &first.datagrams {
+            first_completion = receiver
+                .push_datagram(&datagram.payload)
+                .unwrap()
+                .completed_epoch
+                .or(first_completion);
+        }
+        let mut second_completion = None;
+        for datagram in &second.datagrams {
+            second_completion = receiver
+                .push_datagram(&datagram.payload)
+                .unwrap()
+                .completed_epoch
+                .or(second_completion);
+        }
+
+        assert_eq!(first_completion.unwrap().epoch_id, 20);
+        assert_eq!(second_completion.unwrap().epoch_id, 21);
+        assert_eq!(receiver.stats().epochs_completed, 2);
+        assert_eq!(receiver.stats().duplicate_or_late_epochs, 1);
     }
 
-    fn decoded_frame(pts_samples: u64) -> DecodedMusicAudioFrame {
-        DecodedMusicAudioFrame {
-            sequence: pts_samples / 120,
+    fn epoch<'a>(
+        epoch_id: u64,
+        pts_samples: u64,
+        groups: &'a [MultichannelAudioGroup<'a>],
+    ) -> MultichannelAudioEpoch<'a> {
+        MultichannelAudioEpoch {
+            session_id: 42,
+            config_generation: 1,
+            epoch_id,
             pts_samples,
-            payload: Bytes::from(test_payload((pts_samples / 120) as u8, 16)),
+            sample_rate: 48_000,
+            frame_count: 240,
+            groups,
+        }
+    }
+
+    fn pcm_group<'a>(
+        group_id: u16,
+        channel_start: u16,
+        channel_count: u16,
+        payload: &'a [u8],
+    ) -> MultichannelAudioGroup<'a> {
+        MultichannelAudioGroup {
+            group_id,
+            channel_start,
+            channel_count,
+            payload_kind: AudioPayloadKind::Pcm,
+            sample_format: AudioSampleFormat::S24Le,
+            flags: 0,
+            payload,
         }
     }
 

@@ -7,15 +7,21 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use raptorq_datagram_fec::{
-    DatagramFecDecoder, DatagramFecEncoder, DatagramFecError, DecodedMediaFrame, EncodedMediaBlock,
-    FecDecision, MediaFecDecoder, MediaFecEncoder, MediaFecError, MediaFrame, SequenceStats,
+    DatagramFecDecoder, DatagramFecEncoder, DatagramFecError, DecodedMediaFrame,
+    DecodedMultichannelAudioShard, EncodedMediaBlock, EncodedMultichannelAudioEpoch, FecDecision,
+    MediaFecDecoder, MediaFecEncoder, MediaFecError, MediaFrame, MultichannelAudioDatagramRole,
+    MultichannelAudioFecConfig, MultichannelAudioFecDecoder, MultichannelAudioFecError,
+    SequenceStats,
 };
 use std::fmt;
 
 pub const STREAM_ID_PREFIX_LEN: usize = 8;
+pub const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC: [u8; 4] = *b"AEP1";
+pub const MULTICHANNEL_AUDIO_TRANSPORT_MAGIC_LEN: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FecTransportKind {
+    Udp,
     WebTransport,
     WebRtc,
 }
@@ -42,6 +48,13 @@ pub struct FecTransportConfig {
 }
 
 impl FecTransportConfig {
+    pub fn udp() -> Self {
+        Self {
+            kind: FecTransportKind::Udp,
+            stream_id_mode: StreamIdMode::None,
+        }
+    }
+
     pub fn webtransport() -> Self {
         Self {
             kind: FecTransportKind::WebTransport,
@@ -63,6 +76,261 @@ impl FecTransportConfig {
         }
     }
 }
+
+/// Stateless framing adapter for already-RaptorQ-encoded audio epochs.
+///
+/// This layer never re-encodes an epoch. It reserves any transport prefix in
+/// the packetizer's MTU budget, preserves source/repair metadata for pacing,
+/// and rejects source packets that appear after repair packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultichannelAudioTransportAdapter {
+    transport: FecTransportConfig,
+    max_datagram_size: usize,
+}
+
+impl MultichannelAudioTransportAdapter {
+    pub fn new(transport: FecTransportConfig, max_datagram_size: usize) -> Self {
+        Self {
+            transport,
+            max_datagram_size,
+        }
+    }
+
+    pub fn webtransport(max_datagram_size: usize) -> Self {
+        Self::new(FecTransportConfig::webtransport(), max_datagram_size)
+    }
+
+    pub fn udp(max_datagram_size: usize) -> Self {
+        Self::new(FecTransportConfig::udp(), max_datagram_size)
+    }
+
+    pub fn webtransport_with_stream_prefix(stream_id: u64, max_datagram_size: usize) -> Self {
+        Self::new(
+            FecTransportConfig::webtransport_with_stream_prefix(stream_id),
+            max_datagram_size,
+        )
+    }
+
+    pub fn webrtc(max_datagram_size: usize) -> Self {
+        Self::new(FecTransportConfig::webrtc(), max_datagram_size)
+    }
+
+    pub fn max_datagram_size(&self) -> usize {
+        self.max_datagram_size
+    }
+
+    pub fn transport_overhead(&self) -> usize {
+        MULTICHANNEL_AUDIO_TRANSPORT_MAGIC_LEN
+            + match self.transport.stream_id_mode {
+                StreamIdMode::None => 0,
+                StreamIdMode::Prefix64Be(_) => STREAM_ID_PREFIX_LEN,
+            }
+    }
+
+    /// Makes the packetizer's size budget match this complete transport message.
+    pub fn prepare_fec_config(
+        &self,
+        mut config: MultichannelAudioFecConfig,
+    ) -> MultichannelAudioFecConfig {
+        config.max_datagram_size = self.max_datagram_size;
+        config.transport_overhead = self.transport_overhead();
+        config
+    }
+
+    pub fn wrap_epoch(
+        &self,
+        encoded: EncodedMultichannelAudioEpoch,
+    ) -> Result<EncodedTransportMultichannelAudioEpoch, MultichannelAudioTransportError> {
+        let prefix = self.transport.stream_id_mode.prefix();
+        let mut saw_repair = false;
+        let mut datagrams = Vec::with_capacity(encoded.datagrams.len());
+
+        for datagram in encoded.datagrams {
+            match datagram.role {
+                MultichannelAudioDatagramRole::Source { .. } if saw_repair => {
+                    return Err(MultichannelAudioTransportError::SourceAfterRepair {
+                        packet_sequence: datagram.packet_sequence,
+                    });
+                }
+                MultichannelAudioDatagramRole::Source { .. } => {}
+                MultichannelAudioDatagramRole::Repair { .. } => saw_repair = true,
+            }
+            let payload = add_prefix_bytes(prefix, add_audio_epoch_prefix(datagram.payload));
+            if payload.len() > self.max_datagram_size {
+                return Err(MultichannelAudioTransportError::DatagramTooLarge {
+                    actual: payload.len(),
+                    max: self.max_datagram_size,
+                });
+            }
+            datagrams.push(MultichannelAudioTransportDatagram {
+                block_id: datagram.block_id,
+                packet_sequence: datagram.packet_sequence,
+                role: datagram.role,
+                playout_pts_samples: encoded.pts_samples,
+                payload,
+            });
+        }
+
+        Ok(EncodedTransportMultichannelAudioEpoch {
+            session_id: encoded.session_id,
+            config_generation: encoded.config_generation,
+            epoch_id: encoded.epoch_id,
+            pts_samples: encoded.pts_samples,
+            sample_rate: encoded.sample_rate,
+            frame_count: encoded.frame_count,
+            block_id: encoded.block_id,
+            source_symbols: encoded.source_symbols,
+            repair_symbols: encoded.repair_symbols,
+            datagrams,
+        })
+    }
+
+    pub fn payload<'a>(
+        &self,
+        datagram: &'a [u8],
+    ) -> Result<&'a [u8], MultichannelAudioTransportError> {
+        let datagram = strip_transport_prefix(self.transport.stream_id_mode, datagram)
+            .map_err(MultichannelAudioTransportError::Transport)?;
+        strip_audio_epoch_prefix(datagram)
+    }
+
+    pub fn push_datagram(
+        &self,
+        decoder: &mut MultichannelAudioFecDecoder,
+        datagram: &[u8],
+    ) -> Result<Vec<DecodedMultichannelAudioShard>, MultichannelAudioTransportError> {
+        decoder
+            .push_datagram(self.payload(datagram)?)
+            .map_err(MultichannelAudioTransportError::Audio)
+    }
+
+    pub async fn send_epoch<T>(
+        &self,
+        sender: &mut T,
+        encoded: EncodedMultichannelAudioEpoch,
+    ) -> Result<MultichannelAudioSendReport, MultichannelAudioSendError<T::Error>>
+    where
+        T: DatagramSender + Send,
+    {
+        let encoded = self
+            .wrap_epoch(encoded)
+            .map_err(MultichannelAudioSendError::Adapter)?;
+        let mut report = MultichannelAudioSendReport::default();
+        for datagram in encoded.datagrams {
+            sender
+                .send_datagram(datagram.payload)
+                .await
+                .map_err(MultichannelAudioSendError::Transport)?;
+            match datagram.role {
+                MultichannelAudioDatagramRole::Source { .. } => {
+                    report.source_datagrams += 1;
+                }
+                MultichannelAudioDatagramRole::Repair { .. } => {
+                    report.repair_datagrams += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultichannelAudioTransportDatagram {
+    pub block_id: u32,
+    pub packet_sequence: u32,
+    pub role: MultichannelAudioDatagramRole,
+    /// The hard playout deadline in the sender's sample-clock domain.
+    pub playout_pts_samples: u64,
+    pub payload: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedTransportMultichannelAudioEpoch {
+    pub session_id: u64,
+    pub config_generation: u32,
+    pub epoch_id: u64,
+    pub pts_samples: u64,
+    pub sample_rate: u32,
+    pub frame_count: u32,
+    pub block_id: u32,
+    pub source_symbols: u16,
+    pub repair_symbols: u32,
+    /// Strictly source packets followed by repair packets.
+    pub datagrams: Vec<MultichannelAudioTransportDatagram>,
+}
+
+impl EncodedTransportMultichannelAudioEpoch {
+    pub fn source_datagrams(&self) -> impl Iterator<Item = &MultichannelAudioTransportDatagram> {
+        self.datagrams.iter().take_while(|datagram| {
+            matches!(datagram.role, MultichannelAudioDatagramRole::Source { .. })
+        })
+    }
+
+    pub fn repair_datagrams(&self) -> impl Iterator<Item = &MultichannelAudioTransportDatagram> {
+        self.datagrams.iter().skip_while(|datagram| {
+            matches!(datagram.role, MultichannelAudioDatagramRole::Source { .. })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MultichannelAudioSendReport {
+    pub source_datagrams: usize,
+    pub repair_datagrams: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultichannelAudioTransportError {
+    Transport(FecTransportError),
+    Audio(MultichannelAudioFecError),
+    DatagramTooLarge { actual: usize, max: usize },
+    SourceAfterRepair { packet_sequence: u32 },
+    MissingAudioEpochPrefix,
+}
+
+impl fmt::Display for MultichannelAudioTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => write!(formatter, "{error}"),
+            Self::Audio(error) => write!(formatter, "{error}"),
+            Self::DatagramTooLarge { actual, max } => {
+                write!(
+                    formatter,
+                    "audio transport datagram is {actual} bytes; maximum is {max}"
+                )
+            }
+            Self::SourceAfterRepair { packet_sequence } => write!(
+                formatter,
+                "audio source packet {packet_sequence} appears after repair traffic"
+            ),
+            Self::MissingAudioEpochPrefix => {
+                write!(formatter, "missing multichannel audio transport prefix")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MultichannelAudioTransportError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultichannelAudioSendError<T> {
+    Adapter(MultichannelAudioTransportError),
+    Transport(T),
+}
+
+impl<T> fmt::Display for MultichannelAudioSendError<T>
+where
+    T: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Adapter(error) => write!(formatter, "{error}"),
+            Self::Transport(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl<T> std::error::Error for MultichannelAudioSendError<T> where T: fmt::Debug + fmt::Display {}
 
 #[derive(Debug, Clone)]
 pub struct FecDatagramEncoder {
@@ -196,20 +464,7 @@ impl FecDatagramDecoder {
         &self,
         datagram: &'a [u8],
     ) -> Result<&'a [u8], FecTransportError> {
-        match self.stream_id_mode {
-            StreamIdMode::None => Ok(datagram),
-            StreamIdMode::Prefix64Be(expected) => {
-                let (stream_id, payload) = split_stream_id_prefix(datagram)
-                    .ok_or(FecTransportError::MissingStreamIdPrefix)?;
-                if stream_id != expected {
-                    return Err(FecTransportError::UnexpectedStreamId {
-                        expected,
-                        actual: stream_id,
-                    });
-                }
-                Ok(payload)
-            }
-        }
+        strip_transport_prefix(self.stream_id_mode, datagram)
     }
 }
 
@@ -365,12 +620,60 @@ fn add_prefix(prefix: Option<[u8; STREAM_ID_PREFIX_LEN]>, datagram: Vec<u8>) -> 
     prefixed
 }
 
+fn add_prefix_bytes(prefix: Option<[u8; STREAM_ID_PREFIX_LEN]>, datagram: Bytes) -> Bytes {
+    let Some(prefix) = prefix else {
+        return datagram;
+    };
+    let mut prefixed = Vec::with_capacity(STREAM_ID_PREFIX_LEN + datagram.len());
+    prefixed.extend_from_slice(&prefix);
+    prefixed.extend_from_slice(&datagram);
+    Bytes::from(prefixed)
+}
+
+fn add_audio_epoch_prefix(datagram: Bytes) -> Bytes {
+    let mut prefixed = Vec::with_capacity(MULTICHANNEL_AUDIO_TRANSPORT_MAGIC_LEN + datagram.len());
+    prefixed.extend_from_slice(&MULTICHANNEL_AUDIO_TRANSPORT_MAGIC);
+    prefixed.extend_from_slice(&datagram);
+    Bytes::from(prefixed)
+}
+
+pub fn is_multichannel_audio_transport_datagram(datagram: &[u8]) -> bool {
+    datagram.starts_with(&MULTICHANNEL_AUDIO_TRANSPORT_MAGIC)
+}
+
+pub fn strip_audio_epoch_prefix(datagram: &[u8]) -> Result<&[u8], MultichannelAudioTransportError> {
+    datagram
+        .strip_prefix(&MULTICHANNEL_AUDIO_TRANSPORT_MAGIC)
+        .ok_or(MultichannelAudioTransportError::MissingAudioEpochPrefix)
+}
+
+fn strip_transport_prefix(
+    stream_id_mode: StreamIdMode,
+    datagram: &[u8],
+) -> Result<&[u8], FecTransportError> {
+    match stream_id_mode {
+        StreamIdMode::None => Ok(datagram),
+        StreamIdMode::Prefix64Be(expected) => {
+            let (stream_id, payload) =
+                split_stream_id_prefix(datagram).ok_or(FecTransportError::MissingStreamIdPrefix)?;
+            if stream_id != expected {
+                return Err(FecTransportError::UnexpectedStreamId {
+                    expected,
+                    actual: stream_id,
+                });
+            }
+            Ok(payload)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use raptorq_datagram_fec::{
-        AdaptiveFecController, AdaptiveFecPolicy, CongestionConfig, MediaCodec, MediaFrameFlags,
-        MediaFrameMetadata,
+        AdaptiveFecController, AdaptiveFecPolicy, AudioPayloadKind, AudioSampleFormat,
+        CongestionConfig, MediaCodec, MediaFrameFlags, MediaFrameMetadata, MultichannelAudioEpoch,
+        MultichannelAudioFecEncoder, MultichannelAudioGroup,
     };
 
     #[test]
@@ -440,6 +743,66 @@ mod tests {
             .expect("decode")
             .expect("decoded payload");
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn multichannel_audio_adapter_reserves_prefix_and_preserves_source_first_order() {
+        let adapter = MultichannelAudioTransportAdapter::webtransport_with_stream_prefix(42, 1200);
+        let config = adapter.prepare_fec_config(MultichannelAudioFecConfig {
+            repair_symbols: 3,
+            ..MultichannelAudioFecConfig::default()
+        });
+        assert_eq!(
+            config.transport_overhead,
+            STREAM_ID_PREFIX_LEN + MULTICHANNEL_AUDIO_TRANSPORT_MAGIC_LEN
+        );
+        let mut encoder = MultichannelAudioFecEncoder::new(config);
+        let payload = vec![0x55; 8_000];
+        let groups = [MultichannelAudioGroup {
+            group_id: 1,
+            channel_start: 0,
+            channel_count: 16,
+            payload_kind: AudioPayloadKind::Pcm,
+            sample_format: AudioSampleFormat::S24Le,
+            flags: 0,
+            payload: &payload,
+        }];
+        let encoded = encoder
+            .encode_epoch(MultichannelAudioEpoch {
+                session_id: 9,
+                config_generation: 1,
+                epoch_id: 2,
+                pts_samples: 240,
+                sample_rate: 48_000,
+                frame_count: 240,
+                groups: &groups,
+            })
+            .unwrap();
+
+        let wrapped = adapter.wrap_epoch(encoded).unwrap();
+        assert!(wrapped
+            .datagrams
+            .iter()
+            .all(|packet| packet.payload.len() <= 1200));
+        assert_eq!(
+            wrapped.source_datagrams().count(),
+            wrapped.source_symbols as usize
+        );
+        assert_eq!(wrapped.repair_datagrams().count(), 3);
+        assert!(wrapped
+            .datagrams
+            .iter()
+            .all(|packet| packet.playout_pts_samples == 240));
+        assert!(wrapped.datagrams.iter().all(|packet| {
+            packet.payload[STREAM_ID_PREFIX_LEN..].starts_with(&MULTICHANNEL_AUDIO_TRANSPORT_MAGIC)
+        }));
+
+        let mut decoder = MultichannelAudioFecDecoder::new();
+        let first = adapter
+            .push_datagram(&mut decoder, &wrapped.datagrams[0].payload)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].header.pts_samples, 240);
     }
 
     #[test]

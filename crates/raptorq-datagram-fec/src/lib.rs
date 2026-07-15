@@ -1688,10 +1688,10 @@ mod tests {
             .with_symbol_size(80)
             .with_repair_symbols(1);
         let first = first_encoder
-            .encode_block(&vec![0x11; 200])
+            .encode_block(&[0x11; 200])
             .expect("encode first flow");
         let second = second_encoder
-            .encode_block(&vec![0x22; 240])
+            .encode_block(&[0x22; 240])
             .expect("encode second flow");
         assert_eq!(decode_header(&first[0]).unwrap().block_id, 0);
         assert_eq!(decode_header(&second[0]).unwrap().block_id, 0);

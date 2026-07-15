@@ -237,7 +237,7 @@ fn video_access_units_recover_from_feedback_free_loss_matrix() {
                 seed: 0xD317_A11D_E1A5_E5ED,
                 count: 3,
             },
-            max_wire_overhead: 1.25,
+            max_wire_overhead: 1.30,
         },
     ];
 
@@ -301,8 +301,8 @@ fn video_recovery_sweep_covers_burst_periodic_and_random_bounded_loss() {
         ("tiny-key", 4_000, MediaFrameFlags::keyframe(), 1.75),
         ("tiny-delta", 7_200, MediaFrameFlags::default(), 1.36),
         ("small-delta", 9_000, MediaFrameFlags::default(), 1.30),
-        ("delta", 18_000, MediaFrameFlags::default(), 1.25),
-        ("small-key", 24_000, MediaFrameFlags::keyframe(), 1.36),
+        ("delta", 18_000, MediaFrameFlags::default(), 1.30),
+        ("small-key", 24_000, MediaFrameFlags::keyframe(), 1.38),
         ("key", 40_000, MediaFrameFlags::keyframe(), 1.34),
         ("large-key", 96_000, MediaFrameFlags::keyframe(), 1.34),
     ];
@@ -446,7 +446,7 @@ async fn media_fec_recovers_video_access_units_over_lossy_udp_proxy_matrix() {
                 seed: 0xD317_A11D_E1A5_E5ED,
                 count: 3,
             },
-            max_wire_overhead: 1.25,
+            max_wire_overhead: 1.30,
         },
     ];
 
@@ -1971,7 +1971,8 @@ fn bounded_broad_video_drops(
 
         let repair_loss = if profile.repair_noise_every > 0
             && repair_budget >= 2
-            && (frame_index + block.fragment_index as usize) % profile.repair_noise_every == 0
+            && (frame_index + block.fragment_index as usize)
+                .is_multiple_of(profile.repair_noise_every)
         {
             1
         } else {
@@ -2038,7 +2039,7 @@ fn select_bounded_source_losses(
             random_source_losses(&source_indices, count, random_state)
         }
         BoundedLossShape::Alternating { .. } => {
-            if frame_index % 3 == 0 {
+            if frame_index.is_multiple_of(3) {
                 source_indices.into_iter().take(count).collect()
             } else if frame_index % 3 == 1 {
                 source_indices.into_iter().rev().take(count).collect()
@@ -2099,8 +2100,8 @@ fn assert_broad_loss_within_available_repair(
 }
 
 fn randomized_scorecard_payload_len(frame_index: usize) -> usize {
-    if frame_index % 30 == 0 {
-        if frame_index % 60 == 0 {
+    if frame_index.is_multiple_of(30) {
+        if frame_index.is_multiple_of(60) {
             96_000
         } else {
             40_000
@@ -2536,7 +2537,7 @@ fn stream_reorder_delay_ms(ordinal: usize) -> u64 {
         0 => 9,
         4 => 7,
         8 => 4,
-        _ if ordinal % 5 == 0 => 2,
+        _ if ordinal.is_multiple_of(5) => 2,
         _ => 0,
     }
 }
@@ -2935,6 +2936,7 @@ fn video_controller() -> AdaptiveFecController {
         max_repair_symbols: 20,
         delta_repair_floor_source_symbols: 8,
         delta_repair_floor_symbols: 1,
+        loss_repair_safety_symbols: 1,
         min_repair_ratio: 0.04,
         max_repair_ratio: 0.33,
         keyframe_repair_boost: 0.10,

@@ -83,8 +83,8 @@ fn assert_audio_codec_recovers_single_packet_loss(codec: MediaCodec) {
         "Opus/AAC packets in this matrix should each fit in one source symbol"
     );
     assert!(
-        wire_datagrams <= source_datagrams * 2,
-        "audio FEC should stay at one source plus one repair datagram per packet"
+        wire_datagrams <= source_datagrams * 3,
+        "loss-observed audio should stay at one source plus two repair datagrams per packet"
     );
 }
 
@@ -97,8 +97,8 @@ fn assert_single_packet_audio_layout(codec: MediaCodec, encoded: &EncodedMediaFr
         "{codec:?} packet should fit in one source symbol"
     );
     assert_eq!(
-        block.repair_symbols, 1,
-        "{codec:?} should receive one forward repair symbol under the lossy audio profile"
+        block.repair_symbols, 2,
+        "{codec:?} should receive ratio repair plus one tail-safety symbol under the lossy audio profile"
     );
     assert_eq!(
         block.datagram_count,
@@ -131,6 +131,7 @@ fn audio_controller() -> AdaptiveFecController {
         max_repair_symbols: 2,
         delta_repair_floor_source_symbols: 8,
         delta_repair_floor_symbols: 1,
+        loss_repair_safety_symbols: 1,
         min_repair_ratio: 0.04,
         max_repair_ratio: 0.5,
         keyframe_repair_boost: 0.10,

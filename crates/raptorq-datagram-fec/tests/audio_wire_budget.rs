@@ -53,11 +53,11 @@ fn observed_loss_adds_small_repair_and_recovers_the_audio_frame() {
     let stats = encoded.stats();
 
     assert_eq!(stats.source_datagrams, 1);
-    assert_eq!(stats.repair_datagrams, 1);
-    assert_eq!(stats.wire_datagrams, 2);
+    assert_eq!(stats.repair_datagrams, 2);
+    assert_eq!(stats.wire_datagrams, 3);
     assert!(
-        stats.wire_bytes * FRAMES_PER_SECOND <= 96_000,
-        "loss-triggered 1:1 repair must stay at or below 768 kbps including headers"
+        stats.wire_bytes * FRAMES_PER_SECOND <= 144_000,
+        "loss-triggered audio tail protection must stay at or below 1.152 Mbps including headers"
     );
 
     let source_index = encoded.blocks[0].source_datagram_indices().start;
@@ -65,9 +65,12 @@ fn observed_loss_adds_small_repair_and_recovers_the_audio_frame() {
     let mut decoded = None;
     for (index, datagram) in encoded.datagrams.iter().enumerate() {
         if index != source_index {
-            decoded = decoder
+            let recovered = decoder
                 .push_datagram(datagram)
                 .expect("decode repair datagram");
+            if recovered.is_some() {
+                decoded = recovered;
+            }
         }
     }
     let decoded = decoded.expect("repair symbol should recover the audio frame");

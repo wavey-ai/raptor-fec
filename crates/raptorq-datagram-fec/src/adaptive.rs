@@ -85,6 +85,10 @@ pub struct AdaptiveFecPolicy {
     pub max_repair_symbols: u32,
     pub delta_repair_floor_source_symbols: u16,
     pub delta_repair_floor_symbols: u32,
+    /// Extra tail margin added when the controller has observed non-zero loss.
+    /// The symbol is applied after ratio and media-priority floors, then capped
+    /// by `max_repair_symbols`.
+    pub loss_repair_safety_symbols: u32,
     pub min_repair_ratio: f32,
     pub max_repair_ratio: f32,
     pub keyframe_repair_boost: f32,
@@ -101,6 +105,7 @@ impl Default for AdaptiveFecPolicy {
             max_repair_symbols: 16,
             delta_repair_floor_source_symbols: 8,
             delta_repair_floor_symbols: 1,
+            loss_repair_safety_symbols: 1,
             min_repair_ratio: DEFAULT_MIN_REPAIR_RATIO,
             max_repair_ratio: DEFAULT_MAX_REPAIR_RATIO,
             keyframe_repair_boost: 0.10,
@@ -119,6 +124,8 @@ impl AdaptiveFecPolicy {
         let min_repair_symbols = self.min_repair_symbols.min(self.max_repair_symbols);
         let delta_repair_floor_symbols =
             self.delta_repair_floor_symbols.min(self.max_repair_symbols);
+        let loss_repair_safety_symbols =
+            self.loss_repair_safety_symbols.min(self.max_repair_symbols);
 
         Self {
             min_source_symbols,
@@ -127,6 +134,7 @@ impl AdaptiveFecPolicy {
             max_repair_symbols: self.max_repair_symbols,
             delta_repair_floor_source_symbols: self.delta_repair_floor_source_symbols.max(1),
             delta_repair_floor_symbols,
+            loss_repair_safety_symbols,
             min_repair_ratio,
             max_repair_ratio,
             keyframe_repair_boost: self.keyframe_repair_boost.max(0.0),
@@ -311,9 +319,17 @@ impl AdaptiveFecController {
             }
             _ => 0,
         };
+        let repair = repair.max(self.policy.min_repair_symbols).max(media_floor);
+        let tail_safety_eligible =
+            matches!(priority, MediaPriority::Audio | MediaPriority::VideoKey)
+                || source_symbols >= self.policy.delta_repair_floor_source_symbols;
+        let loss_safety = if self.metrics.loss_fraction > 0.0 && tail_safety_eligible {
+            self.policy.loss_repair_safety_symbols
+        } else {
+            0
+        };
         repair
-            .max(self.policy.min_repair_symbols)
-            .max(media_floor)
+            .saturating_add(loss_safety)
             .min(self.policy.max_repair_symbols)
     }
 
@@ -436,8 +452,45 @@ mod tests {
         let decision = controller.decide(172, MediaPriority::Audio);
 
         assert_eq!(decision.source_symbols_for_payload, 1);
+        assert_eq!(decision.config.repair_symbols, 2);
+        assert_eq!(decision.expected_datagrams, 3);
+    }
+
+    #[test]
+    fn observed_loss_adds_tail_safety_after_delta_floor() {
+        let mut controller = AdaptiveFecController::default();
+        controller.update_network_metrics(NetworkMetrics {
+            loss_fraction: 0.02,
+            ..NetworkMetrics::default()
+        });
+
+        let decision = controller.decide(
+            10 * usize::from(DEFAULT_SYMBOL_SIZE),
+            MediaPriority::VideoDelta,
+        );
+
+        assert_eq!(decision.source_symbols_for_payload, 10);
+        assert_eq!(decision.config.repair_symbols, 2);
+        assert_eq!(decision.expected_datagrams, 12);
+    }
+
+    #[test]
+    fn loss_tail_safety_respects_the_repair_cap() {
+        let policy = AdaptiveFecPolicy {
+            min_repair_symbols: 1,
+            max_repair_symbols: 1,
+            loss_repair_safety_symbols: 4,
+            ..AdaptiveFecPolicy::default()
+        };
+        let mut controller = AdaptiveFecController::new(policy, CongestionConfig::default());
+        controller.update_network_metrics(NetworkMetrics {
+            loss_fraction: 0.2,
+            ..NetworkMetrics::default()
+        });
+
+        let decision = controller.decide(16_000, MediaPriority::VideoKey);
+
         assert_eq!(decision.config.repair_symbols, 1);
-        assert_eq!(decision.expected_datagrams, 2);
     }
 
     #[test]

@@ -7,7 +7,8 @@
 
 use crate::{
     decode_header, DatagramFecDecoder, DatagramFecEncoder, DatagramFecError, SequenceStats,
-    ENCODING_PACKET_HEADER_LEN, HEADER_LEN,
+    DATAGRAM_AUDIO_SESSION_ID_LEN, DATAGRAM_FLAG_AUDIO_SESSION_ID, ENCODING_PACKET_HEADER_LEN,
+    HEADER_LEN,
 };
 use bytes::Bytes;
 use raptorq::EncodingPacket;
@@ -92,7 +93,7 @@ impl Default for MultichannelAudioFecConfig {
 impl MultichannelAudioFecConfig {
     fn framing_size(self) -> Result<usize, MultichannelAudioFecError> {
         self.transport_overhead
-            .checked_add(HEADER_LEN + ENCODING_PACKET_HEADER_LEN)
+            .checked_add(HEADER_LEN + ENCODING_PACKET_HEADER_LEN + DATAGRAM_AUDIO_SESSION_ID_LEN)
             .ok_or(MultichannelAudioFecError::DatagramBudgetTooSmall {
                 max_datagram_size: self.max_datagram_size,
                 required: usize::MAX,
@@ -562,13 +563,7 @@ impl MultichannelAudioFecEncoder {
         let mut sources = Vec::with_capacity(source_count);
         let mut repairs = Vec::with_capacity(self.config.repair_symbols as usize);
 
-        for datagram in encoded {
-            if datagram.len() + self.config.transport_overhead > self.config.max_datagram_size {
-                return Err(MultichannelAudioFecError::EncodedDatagramTooLarge {
-                    actual: datagram.len() + self.config.transport_overhead,
-                    max: self.config.max_datagram_size,
-                });
-            }
+        for mut datagram in encoded {
             let fec_header = decode_header(&datagram)?;
             let packet = EncodingPacket::deserialize(fec_header.payload(&datagram)?);
             let encoding_symbol_id = packet.payload_id().encoding_symbol_id();
@@ -579,6 +574,15 @@ impl MultichannelAudioFecEncoder {
             } else {
                 MultichannelAudioDatagramRole::Repair { encoding_symbol_id }
             };
+            if matches!(role, MultichannelAudioDatagramRole::Repair { .. }) {
+                attach_audio_session_id(&mut datagram, epoch.session_id)?;
+            }
+            if datagram.len() + self.config.transport_overhead > self.config.max_datagram_size {
+                return Err(MultichannelAudioFecError::EncodedDatagramTooLarge {
+                    actual: datagram.len() + self.config.transport_overhead,
+                    max: self.config.max_datagram_size,
+                });
+            }
             let output = MultichannelAudioDatagram {
                 block_id,
                 packet_sequence: fec_header.packet_sequence,
@@ -610,6 +614,18 @@ impl MultichannelAudioFecEncoder {
             datagrams: sources,
         })
     }
+}
+
+fn attach_audio_session_id(
+    datagram: &mut Vec<u8>,
+    session_id: u64,
+) -> Result<(), MultichannelAudioFecError> {
+    let mut header = decode_header(datagram)?;
+    header.packet_flags |= DATAGRAM_FLAG_AUDIO_SESSION_ID;
+    datagram.extend_from_slice(&session_id.to_le_bytes());
+    header.packet_crc32 = header.compute_packet_crc32(&datagram[HEADER_LEN..])?;
+    header.encode(&mut datagram[..HEADER_LEN])?;
+    Ok(())
 }
 
 fn validate_group(group: &MultichannelAudioGroup<'_>) -> Result<(), MultichannelAudioFecError> {
@@ -647,6 +663,59 @@ pub struct DecodedMultichannelAudioShard {
     pub header: MultichannelAudioShardHeader,
     pub recovery: MultichannelAudioRecovery,
     pub payload: Bytes,
+}
+
+/// Routing identity available without running RaptorQ recovery.
+///
+/// Systematic source datagrams expose their self-describing audio header.
+/// Repair datagrams carry a CRC-protected session-id trailer so relays retain
+/// exact session routing even when every source shard for a block is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultichannelAudioDatagramIdentity {
+    pub block_id: u32,
+    pub packet_sequence: u32,
+    pub source_index: Option<u16>,
+    pub session_id: Option<u64>,
+}
+
+pub fn inspect_multichannel_audio_datagram(
+    datagram: &[u8],
+) -> Result<MultichannelAudioDatagramIdentity, MultichannelAudioFecError> {
+    let fec_header = decode_header(datagram)?;
+    let serialized = fec_header.payload(datagram)?;
+    if serialized.len() < ENCODING_PACKET_HEADER_LEN {
+        return Err(MultichannelAudioFecError::Fec(
+            DatagramFecError::PacketTooShort {
+                actual: datagram.len(),
+            },
+        ));
+    }
+    let packet = EncodingPacket::deserialize(serialized);
+    let encoding_symbol_id = packet.payload_id().encoding_symbol_id();
+    if encoding_symbol_id < u32::from(fec_header.source_symbols) {
+        let source_index = encoding_symbol_id as u16;
+        let shard = decode_symbol(
+            fec_header.block_id,
+            packet.data(),
+            fec_header.source_symbols,
+            source_index,
+            MultichannelAudioRecovery::Systematic,
+        )?;
+        Ok(MultichannelAudioDatagramIdentity {
+            block_id: fec_header.block_id,
+            packet_sequence: fec_header.packet_sequence,
+            source_index: Some(source_index),
+            session_id: Some(shard.header.session_id),
+        })
+    } else {
+        let session_id = fec_header.audio_session_id(datagram)?;
+        Ok(MultichannelAudioDatagramIdentity {
+            block_id: fec_header.block_id,
+            packet_sequence: fec_header.packet_sequence,
+            source_index: None,
+            session_id,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1068,6 +1137,78 @@ mod tests {
     }
 
     #[test]
+    fn routing_inspection_reads_session_from_source_and_repair() {
+        let pcm = vec![3; 2_000];
+        let groups = [pcm_group(4, 0, 2, &pcm)];
+        let mut encoder = MultichannelAudioFecEncoder::new(MultichannelAudioFecConfig {
+            repair_symbols: 2,
+            ..MultichannelAudioFecConfig::default()
+        });
+        let encoded = encoder
+            .encode_epoch(MultichannelAudioEpoch {
+                session_id: 77,
+                config_generation: 5,
+                epoch_id: 8,
+                pts_samples: 960,
+                sample_rate: 48_000,
+                frame_count: 240,
+                groups: &groups,
+            })
+            .unwrap();
+
+        let source = inspect_multichannel_audio_datagram(&encoded.datagrams[0].payload).unwrap();
+        assert_eq!(source.block_id, encoded.block_id);
+        assert_eq!(source.source_index, Some(0));
+        assert_eq!(source.session_id, Some(77));
+
+        let repair = inspect_multichannel_audio_datagram(
+            &encoded.datagrams.last().expect("repair datagram").payload,
+        )
+        .unwrap();
+        assert_eq!(repair.block_id, encoded.block_id);
+        assert_eq!(repair.source_index, None);
+        assert_eq!(repair.session_id, Some(77));
+    }
+
+    #[test]
+    fn repair_only_block_retains_session_and_recovers_epoch() {
+        let pcm = vec![7; 400];
+        let groups = [pcm_group(4, 0, 2, &pcm)];
+        let mut encoder = MultichannelAudioFecEncoder::new(MultichannelAudioFecConfig {
+            repair_symbols: 2,
+            ..MultichannelAudioFecConfig::default()
+        });
+        let encoded = encoder
+            .encode_epoch(MultichannelAudioEpoch {
+                session_id: 88,
+                config_generation: 1,
+                epoch_id: 3,
+                pts_samples: 720,
+                sample_rate: 48_000,
+                frame_count: 240,
+                groups: &groups,
+            })
+            .unwrap();
+        assert_eq!(encoded.source_symbols, 1);
+
+        let mut decoder = MultichannelAudioFecDecoder::new();
+        let mut recovered = Vec::new();
+        for packet in encoded
+            .datagrams
+            .iter()
+            .filter(|packet| matches!(packet.role, MultichannelAudioDatagramRole::Repair { .. }))
+        {
+            let identity = inspect_multichannel_audio_datagram(&packet.payload).unwrap();
+            assert_eq!(identity.session_id, Some(88));
+            recovered.extend(decoder.push_datagram(&packet.payload).unwrap());
+        }
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].recovery, MultichannelAudioRecovery::RaptorQ);
+        assert_eq!(recovered[0].payload.as_ref(), pcm.as_slice());
+    }
+
+    #[test]
     fn raptorq_recovers_missing_same_epoch_groups_exactly() {
         let payloads: Vec<Vec<u8>> = (0..24)
             .map(|index| vec![index as u8; 300 + index * 3])
@@ -1124,7 +1265,9 @@ mod tests {
             ..MultichannelAudioFecConfig::default()
         };
         assert_eq!(
-            crate::datagram_size_for_symbol_size(config.symbol_size().unwrap()) + 8,
+            crate::datagram_size_for_symbol_size(config.symbol_size().unwrap())
+                + config.transport_overhead
+                + crate::DATAGRAM_AUDIO_SESSION_ID_LEN,
             1200
         );
     }
@@ -1148,6 +1291,6 @@ mod tests {
         assert_eq!(geometry.fragment_payload, 720);
         assert_eq!(geometry.symbol_size, 792);
         assert_eq!(geometry.source_symbols, 128);
-        assert_eq!(geometry.source_wire_bytes, 128 * 832);
+        assert_eq!(geometry.source_wire_bytes, 128 * 840);
     }
 }

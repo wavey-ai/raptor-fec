@@ -27,14 +27,15 @@ pub use media::{
     MediaFrameFlags, MediaFrameMetadata, SerializedMediaAccessUnit, MEDIA_FRAME_HEADER_LEN,
 };
 pub use multichannel_audio::{
-    AudioPayloadKind, AudioSampleFormat, DecodedMultichannelAudioShard,
-    EncodedMultichannelAudioEpoch, MultichannelAudioDatagram, MultichannelAudioDatagramRole,
-    MultichannelAudioEpoch, MultichannelAudioFecConfig, MultichannelAudioFecDecoder,
-    MultichannelAudioFecEncoder, MultichannelAudioFecError, MultichannelAudioFecGeometry,
-    MultichannelAudioGroup, MultichannelAudioRecovery, MultichannelAudioShardHeader,
-    DEFAULT_AUDIO_MAX_DATAGRAM_SIZE, DEFAULT_AUDIO_MAX_SOURCE_SYMBOLS,
-    DEFAULT_AUDIO_REPAIR_SYMBOLS, MULTICHANNEL_AUDIO_SHARD_HEADER_LEN,
-    MULTICHANNEL_AUDIO_SHARD_MAGIC, MULTICHANNEL_AUDIO_SHARD_VERSION,
+    inspect_multichannel_audio_datagram, AudioPayloadKind, AudioSampleFormat,
+    DecodedMultichannelAudioShard, EncodedMultichannelAudioEpoch, MultichannelAudioDatagram,
+    MultichannelAudioDatagramIdentity, MultichannelAudioDatagramRole, MultichannelAudioEpoch,
+    MultichannelAudioFecConfig, MultichannelAudioFecDecoder, MultichannelAudioFecEncoder,
+    MultichannelAudioFecError, MultichannelAudioFecGeometry, MultichannelAudioGroup,
+    MultichannelAudioRecovery, MultichannelAudioShardHeader, DEFAULT_AUDIO_MAX_DATAGRAM_SIZE,
+    DEFAULT_AUDIO_MAX_SOURCE_SYMBOLS, DEFAULT_AUDIO_REPAIR_SYMBOLS,
+    MULTICHANNEL_AUDIO_SHARD_HEADER_LEN, MULTICHANNEL_AUDIO_SHARD_MAGIC,
+    MULTICHANNEL_AUDIO_SHARD_VERSION,
 };
 pub use schedule::{
     decide_media_recovery, plan_media_datagrams, plan_media_datagrams_with_deadlines,
@@ -66,7 +67,10 @@ pub const DATAGRAM_VERSION: u8 = 2;
 pub const DATAGRAM_KIND_RAPTORQ: u8 = 1;
 /// Packet CRC32 is present and must verify against the header prefix and payload.
 pub const DATAGRAM_FLAG_PACKET_CRC32: u8 = 1 << 0;
-const SUPPORTED_PACKET_FLAGS: u8 = DATAGRAM_FLAG_PACKET_CRC32;
+/// An eight-byte little-endian audio session id follows the RaptorQ payload.
+pub const DATAGRAM_FLAG_AUDIO_SESSION_ID: u8 = 1 << 1;
+pub const DATAGRAM_AUDIO_SESSION_ID_LEN: usize = 8;
+const SUPPORTED_PACKET_FLAGS: u8 = DATAGRAM_FLAG_PACKET_CRC32 | DATAGRAM_FLAG_AUDIO_SESSION_ID;
 /// Bytes in the per-datagram header.
 pub const HEADER_LEN: usize = 32;
 /// Bytes in RaptorQ's serialized encoding-packet header.
@@ -288,15 +292,15 @@ impl DatagramFecHeader {
             });
         }
 
-        let expected = self.payload_len as usize;
+        let expected = self.payload_len as usize + self.payload_extension_len();
         let actual = datagram.len() - HEADER_LEN;
         if actual != expected {
             return Err(DatagramFecError::PayloadLengthMismatch { expected, actual });
         }
 
-        let payload = &datagram[HEADER_LEN..];
+        let wire_payload = &datagram[HEADER_LEN..];
         if self.packet_flags & DATAGRAM_FLAG_PACKET_CRC32 != 0 {
-            let actual_crc32 = self.compute_packet_crc32(payload)?;
+            let actual_crc32 = self.compute_packet_crc32(wire_payload)?;
             if actual_crc32 != self.packet_crc32 {
                 return Err(DatagramFecError::PacketCrc32Mismatch {
                     expected: self.packet_crc32,
@@ -305,11 +309,24 @@ impl DatagramFecHeader {
             }
         }
 
-        Ok(payload)
+        Ok(&wire_payload[..self.payload_len as usize])
+    }
+
+    pub fn audio_session_id(&self, datagram: &[u8]) -> Result<Option<u64>, DatagramFecError> {
+        let _ = self.payload(datagram)?;
+        if self.packet_flags & DATAGRAM_FLAG_AUDIO_SESSION_ID == 0 {
+            return Ok(None);
+        }
+        let start = HEADER_LEN + self.payload_len as usize;
+        Ok(Some(u64::from_le_bytes(
+            datagram[start..start + DATAGRAM_AUDIO_SESSION_ID_LEN]
+                .try_into()
+                .expect("validated audio session trailer length"),
+        )))
     }
 
     pub fn compute_packet_crc32(&self, payload: &[u8]) -> Result<u32, DatagramFecError> {
-        let expected_len = self.payload_len as usize;
+        let expected_len = self.payload_len as usize + self.payload_extension_len();
         if payload.len() != expected_len {
             return Err(DatagramFecError::PayloadLengthMismatch {
                 expected: expected_len,
@@ -323,7 +340,15 @@ impl DatagramFecHeader {
     }
 
     pub fn datagram_size(&self) -> usize {
-        datagram_size_for_symbol_size(self.symbol_size)
+        datagram_size_for_symbol_size(self.symbol_size) + self.payload_extension_len()
+    }
+
+    const fn payload_extension_len(&self) -> usize {
+        if self.packet_flags & DATAGRAM_FLAG_AUDIO_SESSION_ID != 0 {
+            DATAGRAM_AUDIO_SESSION_ID_LEN
+        } else {
+            0
+        }
     }
 
     /// Return the stable block identity and OTI geometry carried by this packet.

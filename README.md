@@ -85,6 +85,46 @@ exceeded, the caller decides whether to drop, silence, or halt. The caller owns
 the actual monotonic playout deadline; `playout_delay_samples` does not currently
 schedule or enforce one.
 
+## Multichannel Audio Recovery Baseline
+
+The release-only baseline replays deterministic loss and arrival traces through
+the real source-first multichannel encoder/decoder. Its default corpus is 48 kHz
+S24LE PCM, 16 channels, and 5 ms epochs:
+
+```sh
+cargo run --release -p raptorq-datagram-fec \
+  --example audio_recovery_baseline
+```
+
+`NEEDLETAIL_AUDIO_BENCH_CHANNELS`, `NEEDLETAIL_AUDIO_BENCH_EPOCHS`, and
+`NEEDLETAIL_AUDIO_BENCH_DEADLINE_MS` select the channel count, epochs per seed,
+and trace deadline. The JSON separates source and repair datagrams and bytes,
+application framing, and an IPv6/UDP wire estimate. It also exposes repair-ratio
+rounding: a 20% policy produces three repairs for twelve sources (25%), while a
+one-source packet requires one whole repair (100% packet overhead).
+
+Fields prefixed with `trace_` describe deterministic packet-arrival outcomes.
+They do not include measured host execution time. The `observed_elapsed_*`,
+`capture_to_render_ready_elapsed_us`, `encode_elapsed_ns`, and
+`decode_pipeline_elapsed_ns` fields are the measured release-build diagnostics.
+Those per-epoch timings start with an empty simulated execution queue and do not
+model sustained decoder backlog.
+
+`MultichannelAudioFecDecoder::expire_block` releases an incomplete epoch when
+its playout deadline passes. A configurable in-flight limit also expires the
+oldest incomplete epoch, so permanent loss cannot grow decoder state without
+bound. CRC-valid but invalid audio shards are rejected before they can consume
+that capacity or evict live state.
+
+The core tests cover exact opaque FLAC and Opus payload-byte recovery and 5,
+20, 60, 160, 400, and 1,275-byte one-channel mono payload geometry without MTU
+padding.
+This crate preserves each payload's format identity; it does not decode or
+transcode codecs. Opus remains Opus, FLAC remains FLAC, and PCM remains PCM for
+downstream fMP4 LL-HLS packaging. Decoded-PCM exactness for FLAC and decoded
+quality for Opus require the separate codec-integration benchmark; encoded Opus
+must never be decoded merely to re-encode it as FLAC.
+
 ## Useful Deltas From QUIC
 
 RaptorQ-FEC and QUIC solve different parts of the media transport problem.

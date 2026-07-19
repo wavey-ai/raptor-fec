@@ -22,6 +22,7 @@ pub const DEFAULT_AUDIO_MAX_DATAGRAM_SIZE: usize = 1200;
 pub const DEFAULT_AUDIO_MAX_SOURCE_SYMBOLS: u16 = 256;
 pub const DEFAULT_AUDIO_REPAIR_SYMBOLS: u32 = 4;
 const DEFAULT_COMPLETED_AUDIO_BLOCKS: usize = 128;
+const DEFAULT_IN_FLIGHT_AUDIO_BLOCKS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -722,8 +723,11 @@ pub fn inspect_multichannel_audio_datagram(
 pub struct MultichannelAudioFecDecoder {
     fec: DatagramFecDecoder,
     delivered: HashMap<u32, HashSet<u16>>,
+    in_flight: HashSet<u32>,
+    in_flight_order: VecDeque<u32>,
     completed: HashSet<u32>,
     completed_order: VecDeque<u32>,
+    max_in_flight_blocks: usize,
     max_completed_blocks: usize,
 }
 
@@ -738,10 +742,21 @@ impl MultichannelAudioFecDecoder {
         Self {
             fec: DatagramFecDecoder::new(),
             delivered: HashMap::new(),
+            in_flight: HashSet::new(),
+            in_flight_order: VecDeque::new(),
             completed: HashSet::new(),
             completed_order: VecDeque::new(),
+            max_in_flight_blocks: DEFAULT_IN_FLIGHT_AUDIO_BLOCKS,
             max_completed_blocks: DEFAULT_COMPLETED_AUDIO_BLOCKS,
         }
+    }
+
+    /// Bound incomplete epochs that may retain source shards and RaptorQ
+    /// decoder state. The oldest observed incomplete epoch is expired when the
+    /// limit is reached.
+    pub fn with_in_flight_limit(mut self, max_in_flight_blocks: usize) -> Self {
+        self.max_in_flight_blocks = max_in_flight_blocks.max(1);
+        self
     }
 
     pub fn with_completed_window(mut self, max_completed_blocks: usize) -> Self {
@@ -780,6 +795,9 @@ impl MultichannelAudioFecDecoder {
         };
 
         let completed_object = self.fec.push_datagram(datagram)?;
+        if completed_object.is_none() {
+            self.observe_in_flight(fec_header.block_id);
+        }
         let delivered = self.delivered.entry(fec_header.block_id).or_default();
         let mut output = Vec::new();
         if let Some(source) = source_candidate {
@@ -823,14 +841,55 @@ impl MultichannelAudioFecDecoder {
         self.fec.sequence_stats()
     }
 
+    /// Stop retaining an incomplete epoch after its playout deadline.
+    ///
+    /// Late packets for the block are ignored while its id remains in the
+    /// configured completed/expired window.
+    pub fn expire_block(&mut self, block_id: u32) {
+        self.fec.expire_block(block_id);
+        self.close_block(block_id);
+    }
+
+    /// Number of incomplete epochs currently retaining decoder state.
+    pub fn in_flight_block_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    fn observe_in_flight(&mut self, block_id: u32) {
+        if !self.in_flight.insert(block_id) {
+            return;
+        }
+        self.in_flight_order.push_back(block_id);
+        while self.in_flight.len() > self.max_in_flight_blocks {
+            let Some(oldest) = self.in_flight_order.pop_front() else {
+                break;
+            };
+            if self.in_flight.remove(&oldest) {
+                self.fec.expire_block(oldest);
+                self.delivered.remove(&oldest);
+                self.remember_closed(oldest);
+            }
+        }
+    }
+
     fn mark_completed(&mut self, block_id: u32) {
+        self.close_block(block_id);
+    }
+
+    fn close_block(&mut self, block_id: u32) {
+        self.in_flight.remove(&block_id);
+        self.in_flight_order.retain(|current| *current != block_id);
+        self.delivered.remove(&block_id);
+        self.remember_closed(block_id);
+    }
+
+    fn remember_closed(&mut self, block_id: u32) {
         if self.completed.insert(block_id) {
             self.completed_order.push_back(block_id);
         }
         while self.completed_order.len() > self.max_completed_blocks {
             if let Some(expired) = self.completed_order.pop_front() {
                 self.completed.remove(&expired);
-                self.delivered.remove(&expired);
             }
         }
     }
@@ -1070,6 +1129,22 @@ mod tests {
         }
     }
 
+    fn encoded_group(
+        payload_kind: AudioPayloadKind,
+        sample_format: AudioSampleFormat,
+        payload: &[u8],
+    ) -> MultichannelAudioGroup<'_> {
+        MultichannelAudioGroup {
+            group_id: 0,
+            channel_start: 0,
+            channel_count: 1,
+            payload_kind,
+            sample_format,
+            flags: 0,
+            payload,
+        }
+    }
+
     #[test]
     fn multichannel_epoch_is_mtu_safe_and_source_first() {
         let pcm = vec![0x5a; 128 * 240 * 3];
@@ -1105,6 +1180,174 @@ mod tests {
             .iter()
             .take(encoded.source_symbols as usize)
             .all(|packet| matches!(packet.role, MultichannelAudioDatagramRole::Source { .. })));
+    }
+
+    #[test]
+    fn tiny_mono_opus_packets_are_not_padded_to_the_mtu() {
+        let mut encoder = MultichannelAudioFecEncoder::new(MultichannelAudioFecConfig {
+            repair_symbols: 1,
+            ..MultichannelAudioFecConfig::default()
+        });
+
+        for (epoch_id, payload_len) in [5_usize, 20, 60, 160, 400, 1_275].into_iter().enumerate() {
+            let payload = vec![epoch_id as u8; payload_len];
+            let groups = [encoded_group(
+                AudioPayloadKind::Opus,
+                AudioSampleFormat::Unspecified,
+                &payload,
+            )];
+            let encoded = encoder
+                .encode_epoch(MultichannelAudioEpoch {
+                    session_id: 1,
+                    config_generation: 1,
+                    epoch_id: epoch_id as u64,
+                    pts_samples: epoch_id as u64 * 240,
+                    sample_rate: 48_000,
+                    frame_count: 240,
+                    groups: &groups,
+                })
+                .unwrap();
+            let source_bytes = encoded
+                .datagrams
+                .iter()
+                .filter(|packet| {
+                    matches!(packet.role, MultichannelAudioDatagramRole::Source { .. })
+                })
+                .map(|packet| packet.payload.len())
+                .sum::<usize>();
+            let repair_bytes = encoded
+                .datagrams
+                .iter()
+                .filter(|packet| {
+                    matches!(packet.role, MultichannelAudioDatagramRole::Repair { .. })
+                })
+                .map(|packet| packet.payload.len())
+                .sum::<usize>();
+
+            assert_eq!(encoded.repair_datagram_count(), 1);
+            assert!(encoded.datagrams.iter().all(|packet| {
+                packet.payload.len() < MultichannelAudioFecConfig::default().max_datagram_size
+            }));
+            assert!(source_bytes < encoded.source_datagram_count() * 1_200);
+            assert!(repair_bytes < 1_200);
+            if payload_len <= 400 {
+                assert_eq!(encoded.source_symbols, 1);
+                assert_eq!(encoded.source_datagram_count(), 1);
+                // A percentage policy must round K=1 up to one whole repair
+                // datagram: 100% packet overhead, despite the tiny payload.
+                assert_eq!(
+                    encoded.repair_datagram_count() as f64 / encoded.source_datagram_count() as f64,
+                    1.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mono_pcm_and_flac_payloads_use_small_exact_fit_geometry() {
+        for (payload_kind, payload_len) in [
+            (AudioPayloadKind::Pcm, 240 * 3),
+            (AudioPayloadKind::Flac, 360),
+        ] {
+            let payload = vec![0x39; payload_len];
+            let groups = [encoded_group(
+                payload_kind,
+                AudioSampleFormat::S24Le,
+                &payload,
+            )];
+            let config = MultichannelAudioFecConfig {
+                repair_symbols: 1,
+                ..MultichannelAudioFecConfig::default()
+            };
+            let geometry = config.geometry_for_groups(&groups).unwrap();
+            let mut encoder = MultichannelAudioFecEncoder::new(config);
+            let encoded = encoder
+                .encode_epoch(MultichannelAudioEpoch {
+                    session_id: 2,
+                    config_generation: 1,
+                    epoch_id: payload_kind as u64,
+                    pts_samples: 0,
+                    sample_rate: 48_000,
+                    frame_count: 240,
+                    groups: &groups,
+                })
+                .unwrap();
+
+            assert_eq!(geometry.source_symbols, 1);
+            assert_eq!(encoded.source_datagram_count(), 1);
+            assert_eq!(encoded.repair_datagram_count(), 1);
+            assert!(encoded
+                .datagrams
+                .iter()
+                .all(|packet| packet.payload.len() < config.max_datagram_size));
+        }
+    }
+
+    #[test]
+    fn opaque_flac_and_opus_payload_bytes_recover_without_format_conversion() {
+        for (case_index, (payload_kind, sample_format, payload_len)) in [
+            (AudioPayloadKind::Flac, AudioSampleFormat::S24Le, 1_800),
+            (
+                AudioPayloadKind::Opus,
+                AudioSampleFormat::Unspecified,
+                1_275,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let payload = (0..payload_len)
+                .map(|index| mix_test_byte(case_index as u64, index as u64))
+                .collect::<Vec<_>>();
+            let groups = [encoded_group(payload_kind, sample_format, &payload)];
+            let mut encoder = MultichannelAudioFecEncoder::new(MultichannelAudioFecConfig {
+                repair_symbols: 2,
+                ..MultichannelAudioFecConfig::default()
+            });
+            let encoded = encoder
+                .encode_epoch(MultichannelAudioEpoch {
+                    session_id: 3,
+                    config_generation: 1,
+                    epoch_id: case_index as u64,
+                    pts_samples: case_index as u64 * 240,
+                    sample_rate: 48_000,
+                    frame_count: 240,
+                    groups: &groups,
+                })
+                .unwrap();
+            assert!(encoded.source_symbols > 1);
+
+            let mut decoder = MultichannelAudioFecDecoder::new();
+            let mut recovered = vec![0_u8; payload.len()];
+            let mut recovered_ranges = HashSet::new();
+            for packet in &encoded.datagrams {
+                if matches!(
+                    packet.role,
+                    MultichannelAudioDatagramRole::Source { source_index: 0 }
+                ) {
+                    continue;
+                }
+                for shard in decoder.push_datagram(&packet.payload).unwrap() {
+                    assert_eq!(shard.header.payload_kind, payload_kind);
+                    assert_eq!(shard.header.sample_format, sample_format);
+                    let start = shard.header.payload_offset as usize;
+                    let end = start + usize::from(shard.header.payload_len);
+                    recovered[start..end].copy_from_slice(&shard.payload);
+                    recovered_ranges.insert((start, end));
+                }
+            }
+
+            assert_eq!(recovered, payload);
+            assert_eq!(recovered_ranges.len(), usize::from(encoded.source_symbols));
+        }
+    }
+
+    fn mix_test_byte(seed: u64, index: u64) -> u8 {
+        let mut value = seed ^ index.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value as u8
     }
 
     #[test]
@@ -1255,6 +1498,160 @@ mod tests {
                 assert_eq!(actual.recovery, MultichannelAudioRecovery::RaptorQ);
             }
         }
+    }
+
+    #[test]
+    fn incomplete_epochs_are_bounded_and_oldest_is_closed() {
+        let pcm = vec![0x45; 4_000];
+        let groups = [pcm_group(1, 0, 8, &pcm)];
+        let mut encoder = MultichannelAudioFecEncoder::new(MultichannelAudioFecConfig {
+            repair_symbols: 0,
+            ..MultichannelAudioFecConfig::default()
+        });
+        let mut decoder = MultichannelAudioFecDecoder::new()
+            .with_in_flight_limit(4)
+            .with_completed_window(64);
+        let mut first_block = None;
+        let mut first_late_source = None;
+
+        for epoch_id in 0..64 {
+            let encoded = encoder
+                .encode_epoch(MultichannelAudioEpoch {
+                    session_id: 55,
+                    config_generation: 1,
+                    epoch_id,
+                    pts_samples: epoch_id * 240,
+                    sample_rate: 48_000,
+                    frame_count: 240,
+                    groups: &groups,
+                })
+                .unwrap();
+            assert!(encoded.source_symbols > 1);
+            if epoch_id == 0 {
+                first_block = Some(encoded.block_id);
+                first_late_source = Some(encoded.datagrams[1].payload.clone());
+            }
+
+            let shards = decoder
+                .push_datagram(&encoded.datagrams[0].payload)
+                .unwrap();
+            assert_eq!(shards.len(), 1);
+            assert!(decoder.in_flight_block_count() <= 4);
+            assert!(decoder.fec.in_flight_block_count() <= 4);
+            assert!(decoder.delivered.len() <= 4);
+        }
+
+        assert_eq!(decoder.in_flight_block_count(), 4);
+        assert_eq!(decoder.fec.in_flight_block_count(), 4);
+        assert_eq!(decoder.delivered.len(), 4);
+        assert_eq!(decoder.in_flight_order.len(), 4);
+        assert!(decoder.completed.contains(&first_block.unwrap()));
+
+        let late = decoder.push_datagram(&first_late_source.unwrap()).unwrap();
+        assert!(late.is_empty());
+        assert_eq!(decoder.in_flight_block_count(), 4);
+        assert_eq!(decoder.fec.in_flight_block_count(), 4);
+    }
+
+    #[test]
+    fn malformed_new_blocks_cannot_allocate_or_evict_live_epoch_state() {
+        let pcm = vec![0x51; 4_000];
+        let groups = [pcm_group(1, 0, 8, &pcm)];
+        let mut encoder = MultichannelAudioFecEncoder::new(MultichannelAudioFecConfig {
+            repair_symbols: 0,
+            ..MultichannelAudioFecConfig::default()
+        });
+        let encoded = encoder
+            .encode_epoch(MultichannelAudioEpoch {
+                session_id: 57,
+                config_generation: 1,
+                epoch_id: 1,
+                pts_samples: 0,
+                sample_rate: 48_000,
+                frame_count: 240,
+                groups: &groups,
+            })
+            .unwrap();
+        assert!(encoded.source_symbols > 1);
+
+        let mut decoder = MultichannelAudioFecDecoder::new().with_in_flight_limit(1);
+        let first = decoder
+            .push_datagram(&encoded.datagrams[0].payload)
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(decoder.in_flight_block_count(), 1);
+
+        for malformed_block_id in 100..110 {
+            let mut malformed = encoded.datagrams[0].payload.to_vec();
+            malformed[HEADER_LEN + ENCODING_PACKET_HEADER_LEN] ^= 0xff;
+            let mut header = decode_header(&malformed).unwrap();
+            header.block_id = malformed_block_id;
+            header.packet_crc32 = header
+                .compute_packet_crc32(&malformed[HEADER_LEN..])
+                .unwrap();
+            header.encode(&mut malformed[..HEADER_LEN]).unwrap();
+
+            assert!(matches!(
+                decoder.push_datagram(&malformed),
+                Err(MultichannelAudioFecError::InvalidShardMagic { .. })
+            ));
+            assert_eq!(decoder.in_flight_block_count(), 1);
+            assert_eq!(decoder.fec.in_flight_block_count(), 1);
+            assert_eq!(decoder.delivered.len(), 1);
+            assert!(!decoder.completed.contains(&encoded.block_id));
+        }
+
+        let mut delivered = first.len();
+        for packet in encoded.datagrams.iter().skip(1) {
+            delivered += decoder.push_datagram(&packet.payload).unwrap().len();
+        }
+        assert_eq!(delivered, usize::from(encoded.source_symbols));
+        assert_eq!(decoder.in_flight_block_count(), 0);
+        assert_eq!(decoder.fec.in_flight_block_count(), 0);
+    }
+
+    #[test]
+    fn deadline_expiry_releases_incomplete_epoch_and_rejects_late_sources() {
+        let pcm = vec![0x73; 4_000];
+        let groups = [pcm_group(1, 0, 8, &pcm)];
+        let mut encoder = MultichannelAudioFecEncoder::new(MultichannelAudioFecConfig {
+            repair_symbols: 0,
+            ..MultichannelAudioFecConfig::default()
+        });
+        let encoded = encoder
+            .encode_epoch(MultichannelAudioEpoch {
+                session_id: 56,
+                config_generation: 1,
+                epoch_id: 1,
+                pts_samples: 0,
+                sample_rate: 48_000,
+                frame_count: 240,
+                groups: &groups,
+            })
+            .unwrap();
+        assert!(encoded.source_symbols > 1);
+
+        let mut decoder = MultichannelAudioFecDecoder::new();
+        assert_eq!(
+            decoder
+                .push_datagram(&encoded.datagrams[0].payload)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(decoder.in_flight_block_count(), 1);
+        assert_eq!(decoder.fec.in_flight_block_count(), 1);
+
+        decoder.expire_block(encoded.block_id);
+        assert_eq!(decoder.in_flight_block_count(), 0);
+        assert_eq!(decoder.fec.in_flight_block_count(), 0);
+        assert!(decoder.delivered.is_empty());
+
+        for packet in encoded.datagrams.iter().skip(1) {
+            assert!(decoder.push_datagram(&packet.payload).unwrap().is_empty());
+        }
+        assert_eq!(decoder.in_flight_block_count(), 0);
+        assert_eq!(decoder.fec.in_flight_block_count(), 0);
     }
 
     #[test]

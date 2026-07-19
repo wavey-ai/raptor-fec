@@ -1292,6 +1292,24 @@ impl DatagramFecDecoder {
         self.sequence_tracker.stats()
     }
 
+    /// Stop retaining recovery state for a block whose delivery deadline has
+    /// passed.
+    ///
+    /// The block id remains in the bounded duplicate-suppression window, so a
+    /// late datagram cannot recreate the discarded decoder and grow memory
+    /// again. Live callers should expire incomplete blocks when their playout
+    /// deadline passes.
+    pub fn expire_block(&mut self, block_id: u32) {
+        self.blocks.remove(&block_id);
+        self.completed.insert(block_id);
+        self.prune(block_id);
+    }
+
+    /// Number of source blocks currently retaining RaptorQ decoder state.
+    pub fn in_flight_block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
     fn prune(&mut self, current_block_id: u32) {
         let cutoff = current_block_id.wrapping_sub(COMPLETED_WINDOW);
         self.blocks
@@ -1810,6 +1828,32 @@ mod tests {
             .push_datagram(&datagrams[1])
             .expect("ignore duplicate block packet");
         assert!(duplicate.is_none());
+    }
+
+    #[test]
+    fn expired_block_releases_state_and_ignores_late_packets() {
+        let payload = vec![0x2a; 96];
+        let mut encoder = DatagramFecEncoder::new()
+            .with_source_symbols(2)
+            .with_symbol_size(48)
+            .with_repair_symbols(0);
+        let datagrams = encoder.encode_block(&payload).expect("encode block");
+        let block_id = decode_header(&datagrams[0]).expect("header").block_id;
+        let mut decoder = DatagramFecDecoder::new();
+
+        assert!(decoder
+            .push_datagram(&datagrams[0])
+            .expect("decode first source")
+            .is_none());
+        assert_eq!(decoder.in_flight_block_count(), 1);
+
+        decoder.expire_block(block_id);
+        assert_eq!(decoder.in_flight_block_count(), 0);
+        assert!(decoder
+            .push_datagram(&datagrams[1])
+            .expect("ignore late source")
+            .is_none());
+        assert_eq!(decoder.in_flight_block_count(), 0);
     }
 
     #[test]

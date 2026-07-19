@@ -359,7 +359,7 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "raptorq-datagram-fec"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bytes",
  "raptorq",

@@ -753,17 +753,9 @@ pub fn crc32_ieee(bytes: &[u8]) -> u32 {
 }
 
 pub fn crc32_ieee_update(previous: u32, bytes: &[u8]) -> u32 {
-    let mut crc = !previous;
-
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-
-    !crc
+    let mut hasher = crc32fast::Hasher::new_with_initial(previous);
+    hasher.update(bytes);
+    hasher.finalize()
 }
 
 pub fn packet_crc32(header_without_crc: &[u8], payload: &[u8]) -> u32 {
@@ -1519,6 +1511,35 @@ mod tests {
     #[test]
     fn crc32_ieee_uses_standard_vector() {
         assert_eq!(crc32_ieee(b"123456789"), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn crc32_ieee_fast_path_matches_the_bitwise_wire_reference() {
+        fn reference_update(previous: u32, bytes: &[u8]) -> u32 {
+            let mut crc = !previous;
+            for &byte in bytes {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    let mask = (crc & 1).wrapping_neg();
+                    crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+                }
+            }
+            !crc
+        }
+
+        let payload = (0..4_096_u32)
+            .map(|index| index.wrapping_mul(1_103_515_245).wrapping_add(12_345) as u8)
+            .collect::<Vec<_>>();
+        let expected = reference_update(0, &payload);
+        assert_eq!(crc32_ieee(&payload), expected);
+        for split in [0, 1, 31, 32, 255, 2_048, payload.len()] {
+            let first = crc32_ieee(&payload[..split]);
+            assert_eq!(
+                crc32_ieee_update(first, &payload[split..]),
+                expected,
+                "incremental CRC diverged at split {split}"
+            );
+        }
     }
 
     #[test]

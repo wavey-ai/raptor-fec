@@ -41,6 +41,14 @@ The fixed header is 32 bytes:
 - `payload_len`: exact byte length of the serialized RaptorQ payload.
 - `packet_crc32`: IEEE CRC32 over the encoded header prefix and payload. The stored CRC field itself is excluded from the checksum, matching the SoundKit v2 packet-header convention.
 
+The CRC implementation uses `crc32fast` with an explicit initial state. This
+changes no RQD2 bytes or incremental-update semantics: reference bitwise,
+single-pass, split-update, empty-input, and known-vector tests must all agree.
+In the matched Needletail private-GCP profile, this removed the prior bitwise
+CRC hot spot while preserving exact delivery; the product-level result and its
+remaining strict deadline failure are documented in
+[`Needletail's tail-bundle report`](../needletail/docs/real-world-tests/2026-07-19-opus-h3-tail-bundle.md).
+
 Media frames can still use the optional 44-byte protected fragment header above
 the byte payload when a caller wants a `u64` stream id, access-unit sequence,
 PTS/DTS delta, duration, initialization/keyframe/config flags, and fragment boundaries. The
@@ -187,19 +195,19 @@ NANORQ_DIR=/tmp/nanorq cargo test -p raptorq-datagram-fec --test nanorq_interop 
 The `video_loss_matrix` integration test exercises H.264-style access units
 through the real media FEC encoder/decoder. It verifies:
 
-- keyframe recovery under burst and periodic datagram loss;
-- delta-frame recovery under bounded random loss;
-- fail-closed behavior when loss exceeds the configured repair budget;
+- keyframe recovery under burst and periodic datagram loss
+- delta-frame recovery under bounded random loss
+- fail-closed behavior when loss exceeds the configured repair budget
 - a deterministic payload-size sweep over tiny/small/large keyframes and delta
   frames, with front-burst, late-burst, periodic, and random source loss kept
   within each FEC block's repair budget, plus a fail-closed check one source
-  datagram past the per-block repair budget;
+  datagram past the per-block repair budget
 - explicit source-symbol accounting per FEC block, so recoverable cases do not
   get credit for merely dropping repair packets or staying under a frame-level
-  aggregate repair count;
+  aggregate repair count
 - a 90-frame stream where RaptorQ FEC repairs keyframe and delta losses inside a
   33 ms playout budget while a RIST/SRT-style feedback retransmission model
-  misses those frames at 70 ms RTT plus RIST's default 20 ms feedback interval;
+  misses those frames at 70 ms RTT plus RIST's default 20 ms feedback interval
 - the same feedback model catches up when the playout buffer is raised above the
   feedback turn plus RTT, making the latency tradeoff explicit.
 - a pure-RIST-core comparison that uses `SimpleSenderCore` and

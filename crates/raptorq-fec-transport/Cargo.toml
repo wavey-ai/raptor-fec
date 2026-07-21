@@ -1,6 +1,6 @@
 [package]
 name = "raptorq-fec-transport"
-version = "0.1.3"
+version = "0.1.4"
 edition.workspace = true
 description = "FEC wrappers for WebTransport datagrams and WebRTC data channels."
 repository.workspace = true

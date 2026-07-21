@@ -265,11 +265,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "music-audio-session"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "891bedab016a7f80d57ef94688df9c56971474bba8441429ceff2285a88ce37f"
+dependencies = [
+ "bytes",
+ "raptorq-datagram-fec 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "music-audio-session-wasm"
 version = "0.1.0"
 dependencies = [
  "js-sys",
- "music-audio-session",
+ "music-audio-session 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "raptorq-datagram-fec 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "raptorq-fec-transport 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "wasm-bindgen",

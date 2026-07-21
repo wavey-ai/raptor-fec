@@ -258,20 +258,10 @@ dependencies = [
 
 [[package]]
 name = "music-audio-session"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
- "raptorq-datagram-fec 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
-name = "music-audio-session"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62444c7075fbfcd0adfe50b7a320136f6955954b04e0626ea9236665e37749a5"
-dependencies = [
- "bytes",
- "raptorq-datagram-fec 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "raptorq-datagram-fec 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -279,9 +269,9 @@ name = "music-audio-session-wasm"
 version = "0.1.0"
 dependencies = [
  "js-sys",
- "music-audio-session 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "raptorq-datagram-fec 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
- "raptorq-fec-transport",
+ "music-audio-session",
+ "raptorq-datagram-fec 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "raptorq-fec-transport 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "wasm-bindgen",
  "wasm-bindgen-test",
 ]
@@ -378,7 +368,7 @@ checksum = "4d4215fb79ef19442a0c71616aabb0715a386e6a16ed9031775ee3e3f20e7502"
 
 [[package]]
 name = "raptorq-datagram-fec"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -391,11 +381,12 @@ dependencies = [
 
 [[package]]
 name = "raptorq-datagram-fec"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab739ed411990e4433b2e198e274e8760d38fc6e321d818b928136599f598c6c"
+checksum = "8514cbef66ffb0b2af04b3eb4dcc91d13ee00ec7ad52c284af3b05b6422b0e57"
 dependencies = [
  "bytes",
+ "crc32fast",
  "raptorq",
 ]
 
@@ -405,7 +396,18 @@ version = "0.1.3"
 dependencies = [
  "async-trait",
  "bytes",
- "raptorq-datagram-fec 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
+ "raptorq-datagram-fec 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "raptorq-fec-transport"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e81cd2a60f440050042d9556a5fc4f3ad9583c4f95f121cf153df12e6c6a5245"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "raptorq-datagram-fec 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]

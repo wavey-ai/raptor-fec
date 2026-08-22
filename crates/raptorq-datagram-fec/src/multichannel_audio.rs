@@ -30,6 +30,10 @@ pub enum AudioPayloadKind {
     Pcm = 1,
     Opus = 2,
     Flac = 3,
+    /// A codec-neutral stream of one or more complete SoundKit v2 packets.
+    /// The FEC layer treats the payload as opaque bytes; consumers inspect the
+    /// inner FrameHeaderV2 only at a decode or packaging boundary.
+    SoundKitV2 = 4,
 }
 
 impl TryFrom<u8> for AudioPayloadKind {
@@ -40,6 +44,7 @@ impl TryFrom<u8> for AudioPayloadKind {
             1 => Ok(Self::Pcm),
             2 => Ok(Self::Opus),
             3 => Ok(Self::Flac),
+            4 => Ok(Self::SoundKitV2),
             actual => Err(MultichannelAudioFecError::UnsupportedPayloadKind(actual)),
         }
     }
@@ -1284,13 +1289,18 @@ mod tests {
     }
 
     #[test]
-    fn opaque_flac_and_opus_payload_bytes_recover_without_format_conversion() {
+    fn opaque_codec_and_soundkit_payload_bytes_recover_without_format_conversion() {
         for (case_index, (payload_kind, sample_format, payload_len)) in [
             (AudioPayloadKind::Flac, AudioSampleFormat::S24Le, 1_800),
             (
                 AudioPayloadKind::Opus,
                 AudioSampleFormat::Unspecified,
                 1_275,
+            ),
+            (
+                AudioPayloadKind::SoundKitV2,
+                AudioSampleFormat::Unspecified,
+                1_473,
             ),
         ]
         .into_iter()

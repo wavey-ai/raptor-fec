@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
+/// How far behind the newest sequence number a missing one is still awaited.
+/// A sequence number that is further behind is counted as lost and forgotten.
 const MAX_TRACKED_GAP: u32 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,11 +31,25 @@ impl SequenceStats {
     }
 }
 
+/// Counts the datagrams of one flow that arrived, that are missing, and that
+/// arrived twice or out of order.
+///
+/// The tracker remembers the sequence numbers that are missing within
+/// `MAX_TRACKED_GAP` of the newest one, and nothing else, so its memory does
+/// not grow with the life of the flow. A sequence number that falls out of
+/// that window while it is missing is lost for good: it stays in
+/// `SequenceStats::missing`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SequenceTracker {
-    next_expected: Option<u32>,
+    highest: Option<u32>,
+    /// Sequence numbers below `highest` that have not arrived and are still
+    /// awaited.
     missing: HashSet<u32>,
-    future_received: HashSet<u32>,
+    /// The same numbers, oldest first. A number that has arrived since is
+    /// dropped when it reaches the front.
+    missing_order: VecDeque<u32>,
+    /// Sequence numbers that were given up.
+    lost: u64,
     stats: SequenceStats,
 }
 
@@ -43,45 +59,55 @@ impl SequenceTracker {
     }
 
     pub fn observe(&mut self, sequence: u32) -> SequenceObservation {
-        let expected = self.next_expected.unwrap_or(sequence);
-        let diff = sequence.wrapping_sub(expected);
-        let forward = self.next_expected.is_none() || diff <= i32::MAX as u32;
-        let mut duplicate_or_reordered = !forward;
-        let missing_before = if forward { diff } else { 0 };
-
         self.stats.received = self.stats.received.saturating_add(1);
-        self.stats.highest_seen = Some(self.stats.highest_seen.map_or(sequence, |highest| {
-            let diff = sequence.wrapping_sub(highest);
-            if diff <= i32::MAX as u32 {
-                sequence
-            } else {
-                highest
-            }
-        }));
+        let Some(highest) = self.highest else {
+            self.highest = Some(sequence);
+            self.stats.highest_seen = Some(sequence);
+            return SequenceObservation {
+                sequence,
+                expected: sequence,
+                missing_before: 0,
+                duplicate_or_reordered: false,
+            };
+        };
 
-        if self.next_expected.is_none() {
-            self.next_expected = Some(sequence.wrapping_add(1));
-        } else if self.missing.remove(&sequence) {
-            duplicate_or_reordered = true;
-            if sequence == expected {
-                self.advance_expected(sequence);
-            }
-        } else if forward {
-            if diff == 0 {
-                self.advance_expected(sequence);
-            } else {
-                let mut missing = expected;
-                for _ in 0..diff.min(MAX_TRACKED_GAP) {
-                    self.missing.insert(missing);
-                    missing = missing.wrapping_add(1);
-                }
-                if !self.future_received.insert(sequence) {
-                    duplicate_or_reordered = true;
-                }
-            }
-        }
+        // The oldest sequence number that is still awaited, or the one after
+        // the newest when nothing is missing.
+        let expected = self.oldest_missing().unwrap_or(highest.wrapping_add(1));
+        let from_expected = sequence.wrapping_sub(expected);
+        let at_or_after_expected = from_expected <= i32::MAX as u32;
+        let missing_before = if at_or_after_expected {
+            from_expected
+        } else {
+            0
+        };
 
-        self.stats.missing = self.missing.len() as u64;
+        let ahead = sequence.wrapping_sub(highest);
+        let duplicate_or_reordered = if ahead != 0 && ahead <= i32::MAX as u32 {
+            // The newest so far. The numbers between the last newest and
+            // this one are missing. Only the nearest are awaited.
+            let gap = ahead - 1;
+            let awaited = gap.min(MAX_TRACKED_GAP);
+            self.lost = self.lost.saturating_add(u64::from(gap - awaited));
+            let mut missing = sequence.wrapping_sub(awaited);
+            for _ in 0..awaited {
+                if self.missing.insert(missing) {
+                    self.missing_order.push_back(missing);
+                }
+                missing = missing.wrapping_add(1);
+            }
+            self.highest = Some(sequence);
+            self.stats.highest_seen = Some(sequence);
+            false
+        } else {
+            // An awaited number that arrives late, or a number that has
+            // arrived before or was given up.
+            self.missing.remove(&sequence);
+            true
+        };
+        self.give_up_old();
+
+        self.stats.missing = self.lost.saturating_add(self.missing.len() as u64);
         if duplicate_or_reordered {
             self.stats.duplicate_or_reordered = self.stats.duplicate_or_reordered.saturating_add(1);
         }
@@ -98,14 +124,38 @@ impl SequenceTracker {
         self.stats
     }
 
-    fn advance_expected(&mut self, sequence: u32) {
-        self.missing.remove(&sequence);
-        let mut next = sequence.wrapping_add(1);
-        while self.future_received.remove(&next) {
-            self.missing.remove(&next);
-            next = next.wrapping_add(1);
+    /// Sequence numbers that this tracker holds in memory.
+    pub fn tracked(&self) -> usize {
+        self.missing.len().max(self.missing_order.len())
+    }
+
+    fn oldest_missing(&mut self) -> Option<u32> {
+        while let Some(front) = self.missing_order.front().copied() {
+            if self.missing.contains(&front) {
+                return Some(front);
+            }
+            self.missing_order.pop_front();
         }
-        self.next_expected = Some(next);
+        None
+    }
+
+    /// Count as lost the numbers that are missing and too far behind the
+    /// newest to be awaited.
+    fn give_up_old(&mut self) {
+        let Some(highest) = self.highest else {
+            return;
+        };
+        while let Some(front) = self.missing_order.front().copied() {
+            if !self.missing.contains(&front) {
+                self.missing_order.pop_front();
+            } else if highest.wrapping_sub(front) > MAX_TRACKED_GAP {
+                self.missing.remove(&front);
+                self.missing_order.pop_front();
+                self.lost = self.lost.saturating_add(1);
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -139,5 +189,57 @@ mod tests {
         assert_eq!(wrapped.missing_before, 0);
         assert!(!wrapped.duplicate_or_reordered);
         assert_eq!(tracker.stats().highest_seen, Some(0));
+    }
+
+    #[test]
+    fn a_lost_datagram_does_not_make_the_tracker_remember_every_later_one() {
+        let mut tracker = SequenceTracker::new();
+        tracker.observe(0);
+        // Sequence number 1 never arrives.
+        for sequence in 2..1_000_000_u32 {
+            let observed = tracker.observe(sequence);
+            assert!(!observed.duplicate_or_reordered);
+        }
+        assert!(tracker.tracked() <= 1, "{} tracked", tracker.tracked());
+        let stats = tracker.stats();
+        assert_eq!(stats.received, 999_999);
+        assert_eq!(stats.missing, 1);
+        assert_eq!(stats.duplicate_or_reordered, 0);
+        // The lost one is counted once, however long the flow lives.
+        assert!(stats.loss_fraction() < 0.000_002);
+    }
+
+    #[test]
+    fn datagrams_that_arrive_out_of_order_leave_nothing_behind() {
+        let mut tracker = SequenceTracker::new();
+        // 10, 14, 12, 11, 13: every number arrives, none in its place after
+        // the first. The tracker of 0.1.6 waited for 12 for ever after this.
+        for sequence in [10, 14, 12, 11, 13] {
+            tracker.observe(sequence);
+        }
+        assert_eq!(tracker.stats().missing, 0);
+        assert_eq!(tracker.stats().duplicate_or_reordered, 3);
+        for sequence in 15..200_000_u32 {
+            tracker.observe(sequence);
+        }
+        assert_eq!(tracker.tracked(), 0);
+        assert_eq!(tracker.stats().missing, 0);
+    }
+
+    #[test]
+    fn a_long_outage_counts_what_was_lost_and_tracks_only_the_newest_gap() {
+        let mut tracker = SequenceTracker::new();
+        tracker.observe(0);
+        let observed = tracker.observe(1_000_001);
+        assert_eq!(observed.expected, 1);
+        assert_eq!(observed.missing_before, 1_000_000);
+        assert_eq!(tracker.stats().missing, 1_000_000);
+        assert!(tracker.tracked() <= MAX_TRACKED_GAP as usize);
+        // One of the newest missing numbers arrives late and is no longer
+        // missing. An old one that was given up is only a late datagram.
+        assert!(tracker.observe(1_000_000).duplicate_or_reordered);
+        assert_eq!(tracker.stats().missing, 999_999);
+        assert!(tracker.observe(5).duplicate_or_reordered);
+        assert_eq!(tracker.stats().missing, 999_999);
     }
 }
